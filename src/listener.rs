@@ -128,7 +128,7 @@ async unsafe fn tcp_accept_loop(listener: TcpListener) {
                 continue;
             }
         };
-
+        println!("accepted new connect:");
         // Box the TcpStream → raw pointer
         let boxed = Box::new(client_stream);
         let raw_tcp_ptr: *const TcpStream = &*boxed;

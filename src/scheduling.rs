@@ -55,10 +55,13 @@ pub unsafe fn schedule_immediate(conn: ConnPtr) {
 
 pub unsafe fn schedule_next(conn: ConnPtr, step: NextStep) {
     match step {
+
         // --------------------------------------------------------------
         // Continue immediately
         // --------------------------------------------------------------
         NextStep::Continue(new_state) => {
+            println!("[FSM] Continue → {:?}", new_state);
+
             conn_mut(&conn).state = new_state;
             schedule_immediate(conn);
         }
@@ -68,15 +71,23 @@ pub unsafe fn schedule_next(conn: ConnPtr, step: NextStep) {
         // CLIENT TCP READABLE
         // --------------------------------------------------------------
         NextStep::WaitClientRead => {
-            let c = conn_mut(&conn);
+            // println!("[FSM] WaitClientRead");
 
+            let c = conn_mut(&conn);
+            c.is_reabable = true;
             if let Some(ptr) = c.client_tcp {
-                let tcp = unsafe { ptr.as_ref().unwrap() }.clone();
+                let tcp = ptr.as_ref().unwrap().clone();
 
                 tokio::task::spawn_local(async move {
+                    // println!("[I/O] waiting: client.readable()");
                     let _ = tcp.readable().await;
+                    
+                    // println!("[I/O] ready: client.readable()");
                     schedule_immediate(conn);
                 });
+            } else {
+                println!("[WARN] WaitClientRead but no TCP client");
+                schedule_immediate(conn);
             }
         }
 
@@ -85,15 +96,23 @@ pub unsafe fn schedule_next(conn: ConnPtr, step: NextStep) {
         // CLIENT TCP WRITABLE
         // --------------------------------------------------------------
         NextStep::WaitClientWrite => {
-            let c = conn_mut(&conn);
+            println!("[FSM] WaitClientWrite");
 
+            let c = conn_mut(&conn);
+            c.is_writable = true;
             if let Some(ptr) = c.client_tcp {
-                let tcp = unsafe { ptr.as_ref().unwrap() }.clone();
+                let tcp = ptr.as_ref().unwrap().clone();
 
                 tokio::task::spawn_local(async move {
+                    println!("[I/O] waiting: client.writable()");
                     let _ = tcp.writable().await;
+                    
+                    println!("[I/O] ready: client.writable()");
                     schedule_immediate(conn);
                 });
+            } else {
+                println!("[WARN] WaitClientWrite but no TCP client");
+                schedule_immediate(conn);
             }
         }
 
@@ -102,15 +121,22 @@ pub unsafe fn schedule_next(conn: ConnPtr, step: NextStep) {
         // UPSTREAM TCP READABLE
         // --------------------------------------------------------------
         NextStep::WaitUpstreamRead => {
+            println!("[FSM] WaitUpstreamRead");
+
             let c = conn_mut(&conn);
 
             if let Some(ptr) = c.upstream_tcp {
-                let tcp = unsafe { ptr.as_ref().unwrap() }.clone();
+                let tcp = ptr.as_ref().unwrap().clone();
 
                 tokio::task::spawn_local(async move {
+                    println!("[I/O] waiting: upstream.readable()");
                     let _ = tcp.readable().await;
+                    println!("[I/O] ready: upstream.readable()");
                     schedule_immediate(conn);
                 });
+            } else {
+                println!("[WARN] WaitUpstreamRead but no upstream TCP");
+                schedule_immediate(conn);
             }
         }
 
@@ -119,31 +145,33 @@ pub unsafe fn schedule_next(conn: ConnPtr, step: NextStep) {
         // UPSTREAM TCP WRITABLE
         // --------------------------------------------------------------
         NextStep::WaitUpstreamWrite => {
+            println!("[FSM] WaitUpstreamWrite");
+
             let c = conn_mut(&conn);
 
             if let Some(ptr) = c.upstream_tcp {
-                let tcp = unsafe { ptr.as_ref().unwrap() }.clone();
+                let tcp = ptr.as_ref().unwrap().clone();
 
                 tokio::task::spawn_local(async move {
+                    println!("[I/O] waiting: upstream.writable()");
                     let _ = tcp.writable().await;
+                    println!("[I/O] ready: upstream.writable()");
                     schedule_immediate(conn);
                 });
+            } else {
+                println!("[WARN] WaitUpstreamWrite but no upstream TCP");
+                schedule_immediate(conn);
             }
         }
 
 
         // --------------------------------------------------------------
-        // UDP / QUIC DOES NOT WAIT ON READABILITY/WRTIABILITY
-        //
-        // QUIC flow never uses these states; datagrams trigger FSM.
-        // --------------------------------------------------------------
-
-
-        // --------------------------------------------------------------
-        // Wait for controller message
+        // UDP / QUIC - no waiting here
         // --------------------------------------------------------------
         NextStep::WaitController => {
+            println!("[FSM] WaitController");
             tokio::task::spawn_local(async move {
+                println!("[CTRL] controller event wake");
                 schedule_immediate(conn);
             });
         }
@@ -153,8 +181,11 @@ pub unsafe fn schedule_next(conn: ConnPtr, step: NextStep) {
         // Timer wait
         // --------------------------------------------------------------
         NextStep::WaitTimer(duration) => {
+            println!("[FSM] WaitTimer for {:?}ms", duration.as_millis());
+
             tokio::task::spawn_local(async move {
                 tokio::time::sleep(duration).await;
+                println!("[TIMER] timer done");
                 schedule_immediate(conn);
             });
         }
@@ -164,6 +195,7 @@ pub unsafe fn schedule_next(conn: ConnPtr, step: NextStep) {
         // Connection teardown
         // --------------------------------------------------------------
         NextStep::Close => {
+            println!("[FSM] Close → cleaning up conn");
             cleanup_connection(conn);
         }
     }

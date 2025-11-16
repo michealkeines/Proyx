@@ -45,6 +45,9 @@ pub struct Connection {
 
     pub state: ProxyState,
 
+    pub is_reabable: bool,
+    pub is_writable: bool,
+
 
     // -----------------------------------------------------------------
     // RAW BUFFERS
@@ -170,6 +173,9 @@ impl Connection {
                 crate::states::TransportState::Conn(TransportConnState::AcceptClientConnection)
             ),
 
+            is_reabable: false,
+            is_writable: false,
+
             // buffers
             in_buf, in_cap, in_len: 0,
             out_buf, out_cap, out_len: 0,
@@ -202,6 +208,7 @@ impl Connection {
 // ===================================================================
 
 pub async unsafe fn drive_connection(conn: &mut Connection) -> NextStep {
+    println!("drivecconntion,{:?} ", conn.state);
     match &conn.state {
         ProxyState::Transport(s) => transport_handler(conn, *s).await,
         ProxyState::Tls(s)       => tls_handler(conn, s.clone()).await,

@@ -44,9 +44,14 @@ pub async unsafe fn transport_handler(conn: &mut Connection, s: TransportState) 
 
             TransportConnState::AcceptClientConnection => {
                 // TCP clients → wait for data
-                if conn.client_tcp.is_some() {
+                if conn.client_tcp.is_some() && conn.is_reabable == false {
+                    println!("we have a new connection, upateing to wait client read");
                     return NextStep::WaitClientRead;
                 }
+
+                if (conn.is_reabable) {
+                    conn.is_reabable = false;
+                } 
 
                 // QUIC clients already have packet in in_buf
                 return NextStep::Continue(ProxyState::Detect(
@@ -80,42 +85,43 @@ pub async unsafe fn transport_handler(conn: &mut Connection, s: TransportState) 
 pub async unsafe fn detect_handler(conn: &mut Connection, s: DetectState) -> NextStep {
     match s {
         DetectState::Bootstrap(_) => {
+            // TCP client?
+            if let Some(ptr) = conn.client_tcp {
+                let tcp = (ptr as *mut TcpStream).as_mut().unwrap();
 
-            // TCP version
-            if let Some(stream) = tcp_mut(conn.client_tcp) {
-
+                // Read from TCP into `in_buf`
                 let buf = std::slice::from_raw_parts_mut(conn.in_buf.as_ptr(), conn.in_cap);
-
-                match stream.read(buf).await {
+                let n = match tcp.read(buf).await {
                     Ok(n) if n > 0 => {
                         conn.in_len = n;
-
-                        let data = &buf[..n];
-
-                        // naive H1 detection
-                        if data.starts_with(b"GET ")
-                            || data.starts_with(b"POST ")
-                            || data.starts_with(b"HEAD ")
-                            || data.starts_with(b"PUT ")
-                            || data.starts_with(b"DELETE ")
-                        {
-                            return NextStep::Continue(ProxyState::H1(
-                                H1State::Request(H1RequestParseState::RecvHeaders)
-                            ));
-                        }
-
-                        // fallback assume H1
-                        return NextStep::Continue(ProxyState::H1(
-                            H1State::Request(H1RequestParseState::RecvHeaders)
-                        ));
+                        n
                     }
+                    _ => return NextStep::Close,
+                };
 
-                    _ => return NextStep::Close
+                // check for HTTP/1.x prefix
+                let slice = &buf[..n];
+
+                if slice.starts_with(b"GET ")
+                    || slice.starts_with(b"POST ")
+                    || slice.starts_with(b"HEAD ")
+                    || slice.starts_with(b"PUT ")
+                    || slice.starts_with(b"DELETE ")
+                {
+                    println!("[DETECT] Detected HTTP/1.x");
+                    return NextStep::Continue(ProxyState::H1(
+                        H1State::Request(H1RequestParseState::RecvHeaders)
+                    ));
                 }
+
+                println!("[DETECT] Unknown → treat as HTTP/1.x");
+                return NextStep::Continue(ProxyState::H1(
+                    H1State::Request(H1RequestParseState::RecvHeaders)
+                ));
             }
 
-            // QUIC is not implemented → close
-            NextStep::Close
+            // QUIC not implemented → close
+            return NextStep::Close;
         }
 
         _ => NextStep::Close,
@@ -188,7 +194,7 @@ pub async unsafe fn upstream_handler(conn: &mut Connection, s: UpstreamState) ->
 
         UpstreamState::Dns(UpstreamDnsState::ResolveStart) => {
             // Dummy address for now
-            let addr: Ipv4Addr = "142.250.74.110:80".parse().unwrap();
+            // let addr: Ipv4Addr = "142.250.74.110:80".parse().unwrap();
             conn.scratch = 80;
 
             return NextStep::Continue(ProxyState::Upstream(

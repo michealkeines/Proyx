@@ -1,0 +1,14 @@
+[package]
+name = "Proyx"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+httparse = "1"
+bytes = "1"
+futures = "0.3.31"
+lazy_static = "1.5.0"
+once_cell = "1.21.3"
+seahash = "4.1.0"
+twoway = "0.2.2"

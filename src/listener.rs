@@ -92,13 +92,12 @@ pub async unsafe fn run_main_listener(addr: &str) -> std::io::Result<()> {
 
     // Bind UDP socket inside Box -> raw pointer stable forever
     let udp_box = Box::new(UdpSocket::bind(addr).await?);
-    let udp_ptr: *const UdpSocket = &*udp_box;
+    let udp_ptr: *mut UdpSocket = Box::into_raw(udp_box);
 
     println!("Listening on TCP+UDP {}", addr);
 
     // Keep UDP socket alive forever
     tokio::task::spawn_local(async move {
-        mem::forget(udp_box);
         udp_quic_receive_loop(udp_ptr).await;
     });
 
@@ -131,9 +130,7 @@ async unsafe fn tcp_accept_loop(listener: TcpListener) {
         println!("accepted new connect:");
         // Box the TcpStream → raw pointer
         let boxed = Box::new(client_stream);
-        let raw_tcp_ptr: *const TcpStream = &*boxed;
-        mem::forget(boxed); // leak socket intentionally
-
+        let raw_tcp_ptr: *mut TcpStream = Box::into_raw(boxed);
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
 
         // Allocate Connection → *mut Connection
@@ -161,7 +158,7 @@ async unsafe fn tcp_accept_loop(listener: TcpListener) {
 // ============================================================
 //
 
-async unsafe fn udp_quic_receive_loop(udp_socket_ptr: *const UdpSocket) {
+async unsafe fn udp_quic_receive_loop(udp_socket_ptr: *mut UdpSocket) {
     let mut buf = [0u8; 2048];
 
     loop {
@@ -238,7 +235,7 @@ pub fn quic_extract_dcid(packet: &[u8]) -> u64 {
         return 0;
     }
     unsafe {
-        let ptr = packet.as_ptr().add(2) as *const u64;
+        let ptr = packet.as_ptr().add(2) as *mut u64;
         u64::from_be(*ptr)
     }
 }

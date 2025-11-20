@@ -5,6 +5,8 @@ use std::{
 
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
+use tokio_rustls::server::TlsStream as ServerTlsStream;
+use tokio_rustls::client::TlsStream as ClientTlsStream;
 use crate::handlers::*;
 use crate::states::{ProxyState, TransportConnState};
 use crate::controller::ControllerMsg;
@@ -21,10 +23,10 @@ pub struct Connection {
     // -----------------------------------------------------------------
 
     /// Raw pointer to client TCP stream (None if QUIC)
-    pub client_tcp: Option<*const TcpStream>,
-
+    pub client_tcp: Option<*mut TcpStream>,
+    pub client_tls: Option<*mut ServerTlsStream<TcpStream>>,
     /// Raw pointer to shared UDP socket (only for QUIC)
-    pub client_udp: Option<*const UdpSocket>,
+    pub client_udp: Option<*mut UdpSocket>,
 
     /// Remote peer of QUIC client
     pub client_quic_addr: Option<SocketAddr>,
@@ -34,8 +36,13 @@ pub struct Connection {
     // UPSTREAM SIDE (REMOTE SERVER)
     // -----------------------------------------------------------------
 
-    pub upstream_tcp: Option<*const TcpStream>,
-    pub upstream_udp: Option<*const UdpSocket>,
+    pub upstream_tcp: Option<*mut TcpStream>,
+    pub upstream_tls: Option<*mut ClientTlsStream<TcpStream>>,
+
+
+
+    
+    pub upstream_udp: Option<*mut UdpSocket>,
     pub upstream_quic_addr: Option<SocketAddr>,
 
 
@@ -81,12 +88,12 @@ pub struct Connection {
 impl Connection {
 
     // ===================================================================
-    // PUBLIC CONSTRUCTORS
+    // PUBLIC mutRUCTORS
     // ===================================================================
 
     /// Create a TCP inbound connection with RAW POINTER socket
     pub fn new_tcp_raw(
-        client_ptr: *const TcpStream,
+        client_ptr: *mut TcpStream,
         tx: UnboundedSender<ControllerMsg>,
         rx: UnboundedReceiver<ControllerMsg>,
     ) -> Self {
@@ -96,7 +103,7 @@ impl Connection {
     /// Create a QUIC inbound connection with a raw pointer to shared UDP socket
     pub fn new_udp_raw(
         peer: SocketAddr,
-        udp_ptr: *const UdpSocket,
+        udp_ptr: *mut UdpSocket,
         tx: UnboundedSender<ControllerMsg>,
         rx: UnboundedReceiver<ControllerMsg>,
     ) -> Self {
@@ -106,7 +113,7 @@ impl Connection {
     /// Create a QUIC upstream connection (raw UDP)
     pub fn new_upstream_udp_raw(
         peer: SocketAddr,
-        udp_ptr: *const UdpSocket,
+        udp_ptr: *mut UdpSocket,
         tx: UnboundedSender<ControllerMsg>,
         rx: UnboundedReceiver<ControllerMsg>,
     ) -> Self {
@@ -115,7 +122,7 @@ impl Connection {
 
     /// Create a TCP upstream connection (raw TCP)
     pub fn new_upstream_tcp_raw(
-        tcp_ptr: *const TcpStream,
+        tcp_ptr: *mut TcpStream,
         tx: UnboundedSender<ControllerMsg>,
         rx: UnboundedReceiver<ControllerMsg>,
     ) -> Self {
@@ -124,18 +131,18 @@ impl Connection {
 
 
     // ===================================================================
-    // INTERNAL UNIFIED CONSTRUCTOR
+    // INTERNAL UNIFIED mutRUCTOR
     // ===================================================================
 
     unsafe fn create(
-        client_tcp: Option<*const TcpStream>,
-        client_udp: Option<*const UdpSocket>,
+        client_tcp: Option<*mut TcpStream>,
+        client_udp: Option<*mut UdpSocket>,
         client_quic_addr: Option<SocketAddr>,
 
         tx: UnboundedSender<ControllerMsg>,
         rx: UnboundedReceiver<ControllerMsg>,
-        upstream_tcp: Option<*const TcpStream>,
-        upstream_udp: Option<*const UdpSocket>,
+        upstream_tcp: Option<*mut TcpStream>,
+        upstream_udp: Option<*mut UdpSocket>,
         upstream_quic_addr: Option<SocketAddr>,
     ) -> Self {
 
@@ -160,11 +167,13 @@ impl Connection {
         Self {
             // client raw sockets
             client_tcp,
+            client_tls: None,
             client_udp,
             client_quic_addr,
 
             // upstream raw sockets
             upstream_tcp,
+            upstream_tls: None,
             upstream_udp,
             upstream_quic_addr,
 

@@ -20,7 +20,7 @@ use tokio::{
     net::TcpStream,
 };
 
-use std::sync::Arc;
+use std::{sync::Arc, usize};
 
 use tokio_rustls::{
     TlsAcceptor, TlsConnector, client::TlsStream, rustls::{
@@ -511,14 +511,14 @@ H1State::Forward(H1ForwardState::SendResponseHeadersToClient) => {
     let buf =  std::slice::from_raw_parts_mut(conn.in_buf.as_ptr(), conn.in_cap); 
 
     let n = conn.in_len;
-    if let Some(ptr) = conn.upstream_tls {
-        let mut a = (conn.upstream_tls.unwrap());
+    if let Some(ptr) = conn.client_tls {
+        let mut a = (conn.client_tls.unwrap());
         if let Err(e) = (*a).write_all(&buf[..n]).await {
             println!("[H1]  Req body write error: {}", e);
             return NextStep::Close;
         }
     } else { 
-        let mut a = (conn.upstream_tcp.unwrap());
+        let mut a = (conn.client_tcp.unwrap());
         if let Err(e) = (*a).write_all(&buf[..n]).await {
             println!("[H1]  Req body write error: {}", e);
             return NextStep::Close;
@@ -540,31 +540,54 @@ H1State::Forward(H1ForwardState::SendResponseHeadersToClient) => {
 //--------------------------------------------------------------
 H1State::Forward(H1ForwardState::UpstreamRecvBody) => {
     println!("[H1] UpstreamRecvBody");
+    let mut buf = std::slice::from_raw_parts_mut(conn.in_buf.as_ptr(), conn.in_cap);
+    let mut v = 0;
 
-    let reader: &mut (dyn AsyncRead + Unpin) = if let Some(ptr) = conn.upstream_tls {
-        &mut *(ptr as *mut TlsStream<TcpStream>)
+    if let Some(ptr) = conn.upstream_tls {
+      v =   match (*(conn.upstream_tls.unwrap())).read(&mut buf[conn.in_len..]).await {
+            Ok(0) => {
+                println!("[H1] Upstream body EOF");
+                return NextStep::Close;
+            }
+            Ok(n) => {
+                conn.in_len += n;
+                n
+            }
+            Err(e) => {
+                let err_str = e.to_string();
+            
+                if err_str.contains("peer closed connection without sending TLS close_notify") ||
+                   err_str.contains("UnexpectedEof") {
+                    // Treat as normal EOF
+                    println!("[H1] Upstream body EOF (TLS no close_notify)");
+                    return NextStep::Close;
+                }
+            
+                println!("[H1] Resp body1 read error: {}", e);
+                return NextStep::Close;
+            } 
+        };
     } else {
-        &mut *(conn.upstream_tcp.unwrap() as *mut TcpStream)
-    };
+        match (*(conn.upstream_tcp.unwrap())).read(buf).await {
+            Ok(0) => {
+                println!("[H1] Upstream body EOF");
+                return NextStep::Close;
+            }
+            Ok(n) => {
+                conn.out_len = n;
+                n
+            }
+            Err(e) => {
+                println!("[H1] Resp body read error: {}", e);
+                return NextStep::Close;
+            }
+        };
+    }
 
-    let buf = std::slice::from_raw_parts_mut(conn.out_buf.as_ptr(), conn.out_cap);
+  
 
-    println!("[H1] BUffer ready");
+    println!("[H1] BUffer written: {}/{}\n{:?}", conn.in_len, buf.len(), String::from_utf8(buf[..conn.in_len].to_vec()).unwrap());
 
-    let n = match reader.read(buf).await {
-        Ok(0) => {
-            println!("[H1] Upstream body EOF");
-            return NextStep::Close;
-        }
-        Ok(n) => {
-            conn.out_len = n;
-            n
-        }
-        Err(e) => {
-            println!("[H1] Resp body read error: {}", e);
-            return NextStep::Close;
-        }
-    };
 
     return NextStep::Continue(ProxyState::H1(
         H1State::Forward(H1ForwardState::SendResponseBodyToClient)
@@ -578,16 +601,17 @@ H1State::Forward(H1ForwardState::SendResponseBodyToClient) => {
     println!("[H1] SendResponseBodyToClient");
 
     let buf =  std::slice::from_raw_parts_mut(conn.in_buf.as_ptr(), conn.in_cap);
+    println!("[H1] BUffer read: {}/{}\n{:?}", conn.in_len, buf.len(), String::from_utf8(buf[..conn.in_len].to_vec()).unwrap());
 
     let n = conn.in_len;
-    if let Some(ptr) = conn.upstream_tls {
-        let mut a = (conn.upstream_tls.unwrap());
+    if let Some(ptr) = conn.client_tls{
+        let mut a = (conn.client_tls.unwrap());
         if let Err(e) = (*a).write_all(&buf[..n]).await {
-            println!("[H1]  Res body write error: {}", e);
+            println!("[H1]  Res body1 write error: {}", e);
             return NextStep::Close;
         }
     } else { 
-        let mut a = (conn.upstream_tcp.unwrap());
+        let mut a = (conn.client_tcp.unwrap());
         if let Err(e) = (*a).write_all(&buf[..n]).await {
             println!("[H1]  Res body write error: {}", e);
             return NextStep::Close;
@@ -628,9 +652,9 @@ pub async unsafe fn upstream_handler(conn: &mut Connection, s: UpstreamState) ->
 
         // ----------------------------------------------------------
         UpstreamState::Tcp(UpstreamTcpState::TcpConnectBegin) => {
-            println!("[UPSTREAM] Connecting TCP 142.250.74.110:443");
+            println!("[UPSTREAM] Connecting TCP 142.250.74.4:443");
 
-            match TcpStream::connect("142.250.74.110:443").await {
+            match TcpStream::connect("142.250.74.4:443").await {
                 Ok(s) => {
                     conn.upstream_tcp = Some(
                         Box::into_raw(Box::new(s)) as *mut _

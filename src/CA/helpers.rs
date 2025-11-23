@@ -1,15 +1,17 @@
 use openssl::{
-    x509::{X509, X509NameBuilder, X509Builder, X509Extension},
-    pkey::{PKey, Private},
-    ec::{EcKey, EcGroup},
-    nid::Nid,
     asn1::Asn1Time,
     bn::BigNum,
+    ec::{EcGroup, EcKey},
     hash::MessageDigest,
+    nid::Nid,
+    pkey::{PKey, Private},
+    x509::{X509, X509Builder, X509Extension, X509NameBuilder},
 };
 use rustls_pki_types::{CertificateDer, PrivateKeyDer};
 
-pub unsafe fn build_fake_cert_for_domain(domain: &str) -> (CertificateDer<'static>, PrivateKeyDer<'static>) {
+pub unsafe fn build_fake_cert_for_domain(
+    domain: &str,
+) -> (CertificateDer<'static>, PrivateKeyDer<'static>) {
     // Load CA cert + key
     let ca_cert_der = std::fs::read("/Users/michealkeines/Proyx/src/CA/root.der").unwrap();
     let ca_key_pem = std::fs::read("/Users/michealkeines/Proyx/src/CA/root.key").unwrap();
@@ -33,7 +35,9 @@ pub unsafe fn build_fake_cert_for_domain(domain: &str) -> (CertificateDer<'stati
 
     // Serial
     let mut serial = BigNum::new().unwrap();
-    serial.rand(64, openssl::bn::MsbOption::MAYBE_ZERO, false).unwrap();
+    serial
+        .rand(64, openssl::bn::MsbOption::MAYBE_ZERO, false)
+        .unwrap();
     let serial = serial.to_asn1_integer().unwrap();
     builder.set_serial_number(&serial).unwrap();
 
@@ -41,8 +45,12 @@ pub unsafe fn build_fake_cert_for_domain(domain: &str) -> (CertificateDer<'stati
     builder.set_issuer_name(ca_cert.subject_name()).unwrap();
     builder.set_pubkey(&leaf_key).unwrap();
 
-    builder.set_not_before(&Asn1Time::days_from_now(0).unwrap()).unwrap();
-    builder.set_not_after(&Asn1Time::days_from_now(365).unwrap()).unwrap();
+    builder
+        .set_not_before(&Asn1Time::days_from_now(0).unwrap())
+        .unwrap();
+    builder
+        .set_not_after(&Asn1Time::days_from_now(365).unwrap())
+        .unwrap();
 
     // SAN
     let san = X509Extension::new_nid(
@@ -65,13 +73,8 @@ pub unsafe fn build_fake_cert_for_domain(domain: &str) -> (CertificateDer<'stati
     builder.append_extension(ku).unwrap();
 
     // EKU
-    let eku = X509Extension::new_nid(
-        None,
-        None,
-        openssl::nid::Nid::EXT_KEY_USAGE,
-        "serverAuth",
-    )
-    .unwrap();
+    let eku =
+        X509Extension::new_nid(None, None, openssl::nid::Nid::EXT_KEY_USAGE, "serverAuth").unwrap();
     builder.append_extension(eku).unwrap();
 
     // ---- FIX: ECDSA signing using SHA256 ----

@@ -1,100 +1,61 @@
-//! handlers.rs
-//!
-//! Full MITM support for:
-//!   - HTTP/1
-//!   - CONNECT tunneling
-//!   - TLS interception (fake certificate)
-//!   - Upstream TLS
-//!
-//! Raw pointer architecture only.
+use std::sync::Arc;
 
-use crate::{
-    connection::Connection,
-    fsm::NextStep,
-    states::*,
-};
-
+use crate::{connection::Connection, fsm::NextStep, states::*};
 
 use tokio::{
-    io::{AsyncRead, AsyncReadExt,AsyncWriteExt},
+    io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
     net::TcpStream,
 };
 
-use std::{sync::Arc, usize};
-
-use tokio_rustls::{
-    TlsAcceptor, TlsConnector, client::TlsStream, rustls::{
-        ClientConfig, RootCertStore, ServerConfig, client, pki_types::{CertificateDer, PrivateKeyDer, TrustAnchor, pem::PemObject}, server
-    }
-};
 use crate::CA::helpers::build_fake_cert_for_domain;
+use tokio_rustls::{
+    TlsAcceptor, TlsConnector,
+    client::TlsStream,
+    rustls::{
+        ClientConfig, RootCertStore, ServerConfig, client,
+        pki_types::{CertificateDer, PrivateKeyDer, TrustAnchor, pem::PemObject},
+        server,
+    },
+};
 
-
-// ===============================================================
-// Helper: safely turn raw pointer into &mut TcpStream
-// ===============================================================
-#[inline]
-unsafe fn tcp_mut(ptr: Option<*mut TcpStream>) -> Option<&'static mut TcpStream> {
-    match ptr {
-        Some(p) if !p.is_null() => Some(&mut *(p as *mut TcpStream)),
-        _ => None,
-    }
-}
-
-
-// ===============================================================
-// Helper: RAW TLS stream pointer access
-// (client_tls and upstream_tls stored in conn.scratch_ptrN fields)
-// ===============================================================
-
-// We assume you added these fields in Connection:
-//
-// pub client_tls: Option<*mut TlsStream<TcpStream>>,
-// pub upstream_tls: Option<*mut TlsStream<TcpStream>>,
-//
-// If not – I will update connection struct for you on request.
-
-
-// ===============================================================
-// 1. TRANSPORT HANDLER
-// ===============================================================
+use crate::connection::{ReadEnum, WriteEnum};
 
 pub async unsafe fn transport_handler(conn: &mut Connection, s: TransportState) -> NextStep {
     println!("[TRANSPORT] {:?}", s);
 
     match s {
         TransportState::Conn(state) => match state {
-
             TransportConnState::AcceptClientConnection => {
-                println!("[TRANSPORT] AcceptClientConnection, readable={}", conn.is_reabable);
+                println!(
+                    "[TRANSPORT] AcceptClientConnection, readable={:?}",
+                    conn.readable
+                );
 
-                if conn.client_tcp.is_some() && !conn.is_reabable {
+                if conn.client_tcp.is_some() {
+                    conn.readable = Some(ReadEnum::Tcp(conn.client_tcp.unwrap()));
                     println!(" → Waiting for first client read");
-                    return NextStep::WaitClientRead;
+                    return NextStep::WaitRead(ProxyState::Detect(DetectState::Bootstrap(
+                        DetectBootstrapState::DetectProtocolBegin,
+                    )));
                 }
 
-                if conn.is_reabable {
-                    println!(" → Client readable confirmed");
-                    conn.is_reabable = false;
-                }
-
-                return NextStep::Continue(ProxyState::Detect(
-                    DetectState::Bootstrap(DetectBootstrapState::DetectProtocolBegin)
-                ));
+                return NextStep::Continue(ProxyState::Detect(DetectState::Bootstrap(
+                    DetectBootstrapState::DetectProtocolBegin,
+                )));
             }
 
             TransportConnState::ClientTcpHandshake => {
                 println!("[TRANSPORT] Skipping TCP handshake");
-                return NextStep::Continue(ProxyState::Transport(
-                    TransportState::Conn(TransportConnState::ClientTcpEstablished)
-                ));
+                return NextStep::Continue(ProxyState::Transport(TransportState::Conn(
+                    TransportConnState::ClientTcpEstablished,
+                )));
             }
 
             TransportConnState::ClientTcpEstablished => {
                 println!("[TRANSPORT] Client established –> Detect");
-                return NextStep::Continue(ProxyState::Detect(
-                    DetectState::Bootstrap(DetectBootstrapState::DetectProtocolBegin)
-                ));
+                return NextStep::Continue(ProxyState::Detect(DetectState::Bootstrap(
+                    DetectBootstrapState::DetectProtocolBegin,
+                )));
             }
         },
 
@@ -104,8 +65,6 @@ pub async unsafe fn transport_handler(conn: &mut Connection, s: TransportState) 
         }
     }
 }
-
-
 
 // ===============================================================
 // 2. DETECT HANDLER (TLS / HTTP / CONNECT)
@@ -122,13 +81,11 @@ pub async unsafe fn detect_handler(conn: &mut Connection, s: DetectState) -> Nex
             let n = match (*tcp).peek(buf).await {
                 Ok(n) if n > 0 => {
                     conn.in_len = n;
-                    conn.is_reabable = false;
                     println!("[DETECT] Peeked {} bytes", n);
                     n
                 }
                 _ => return NextStep::Close,
             };
-            
 
             let slice = &buf[..n];
 
@@ -136,18 +93,18 @@ pub async unsafe fn detect_handler(conn: &mut Connection, s: DetectState) -> Nex
             if slice.starts_with(b"CONNECT ") {
                 println!("[DETECT] CONNECT request detected");
 
-                return NextStep::Continue(ProxyState::H1(
-                    H1State::Connect(H1ConnectState::ConnectTunnelEstablished)
-                ));
+                return NextStep::Continue(ProxyState::H1(H1State::Connect(
+                    H1ConnectState::ConnectTunnelEstablished,
+                )));
             }
 
             // TLS ClientHello detection
             if slice.len() > 5 && slice[0] == 0x16 && slice[1] == 0x03 {
                 println!("[DETECT] TLS ClientHello detected");
 
-                return NextStep::Continue(ProxyState::Tls(
-                    TlsState::Handshake(TlsHandshakeState::HandshakeBegin)
-                ));
+                return NextStep::Continue(ProxyState::Tls(TlsState::Handshake(
+                    TlsHandshakeState::HandshakeBegin,
+                )));
             }
 
             // HTTP/1
@@ -156,9 +113,9 @@ pub async unsafe fn detect_handler(conn: &mut Connection, s: DetectState) -> Nex
                 || slice.starts_with(b"HEAD ")
             {
                 println!("[DETECT] HTTP/1.x detected");
-                return NextStep::Continue(ProxyState::H1(
-                    H1State::Request(H1RequestParseState::RecvHeaders)
-                ));
+                return NextStep::Continue(ProxyState::H1(H1State::Request(
+                    H1RequestParseState::RecvHeaders,
+                )));
             }
 
             println!("[DETECT] Unknown protocol – closing");
@@ -169,8 +126,6 @@ pub async unsafe fn detect_handler(conn: &mut Connection, s: DetectState) -> Nex
     }
 }
 
-
-
 // ===============================================================
 // 3. TLS HANDLER – MITM TLS
 // ===============================================================
@@ -179,7 +134,6 @@ pub async unsafe fn tls_handler(conn: &mut Connection, s: TlsState) -> NextStep 
     println!("[TLS] {:?}", s);
 
     match s {
-
         // -----------------------------------------------------------
         // Step 1: Start handshake – build fake cert from SNI
         // -----------------------------------------------------------
@@ -204,9 +158,9 @@ pub async unsafe fn tls_handler(conn: &mut Connection, s: TlsState) -> NextStep 
             let mut acceptor = Box::into_raw(Box::new(TlsAcceptor::from(Arc::new(server_cfg))));
             conn.scratch = acceptor as u64;
 
-            return NextStep::Continue(ProxyState::Tls(
-                TlsState::Handshake(TlsHandshakeState::HandshakeRead)
-            ));
+            return NextStep::Continue(ProxyState::Tls(TlsState::Handshake(
+                TlsHandshakeState::HandshakeRead,
+            )));
         }
 
         // -----------------------------------------------------------
@@ -218,13 +172,11 @@ pub async unsafe fn tls_handler(conn: &mut Connection, s: TlsState) -> NextStep 
             println!("[TLS] Accepting TLS handshake");
 
             // 1. Recover ownership of TcpStream from raw pointer
-            let tcp_box: Box<TcpStream> =
-                Box::from_raw(conn.client_tcp.unwrap() as *mut TcpStream);
-            
+            let tcp_box: Box<TcpStream> = Box::from_raw(conn.client_tcp.unwrap() as *mut TcpStream);
+
             // 2. Get acceptor reference
-            let mut acceptor: &mut TlsAcceptor =
-                &mut *(conn.scratch as *mut TlsAcceptor);
-            
+            let mut acceptor: &mut TlsAcceptor = &mut *(conn.scratch as *mut TlsAcceptor);
+
             // 3. Move TcpStream into accept()  (NO &mut allowed)
             match acceptor.accept(*tcp_box).await {
                 Ok(tls_stream) => {
@@ -237,12 +189,10 @@ pub async unsafe fn tls_handler(conn: &mut Connection, s: TlsState) -> NextStep 
                     return NextStep::Close;
                 }
             }
-            
-            
 
-            return NextStep::Continue(ProxyState::Tls(
-                TlsState::Handshake(TlsHandshakeState::HandshakeComplete)
-            ));
+            return NextStep::Continue(ProxyState::Tls(TlsState::Handshake(
+                TlsHandshakeState::HandshakeComplete,
+            )));
         }
 
         // -----------------------------------------------------------
@@ -251,9 +201,9 @@ pub async unsafe fn tls_handler(conn: &mut Connection, s: TlsState) -> NextStep 
         TlsState::Handshake(TlsHandshakeState::HandshakeComplete) => {
             println!("[TLS] Client TLS Handshake Complete");
 
-            return NextStep::Continue(ProxyState::H1(
-                H1State::Request(H1RequestParseState::RecvHeaders)
-            ));
+            return NextStep::Continue(ProxyState::H1(H1State::Request(
+                H1RequestParseState::RecvHeaders,
+            )));
         }
 
         _ => {
@@ -335,7 +285,6 @@ pub async unsafe fn h1_handler(conn: &mut Connection, s: H1State) -> NextStep {
     println!("[H1] {:?}", s);
 
     match s {
-
         // -----------------------------------------------------------
         // CONNECT tunnel establishment
         // -----------------------------------------------------------
@@ -343,11 +292,13 @@ pub async unsafe fn h1_handler(conn: &mut Connection, s: H1State) -> NextStep {
             println!("[H1] CONNECT: returning 200");
 
             let tcp = conn.client_tcp.unwrap();
-            let _ = (*tcp).write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n").await;
+            let _ = (*tcp)
+                .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                .await;
 
-            return NextStep::Continue(ProxyState::Tls(
-                TlsState::Handshake(TlsHandshakeState::HandshakeBegin)
-            ));
+            return NextStep::Continue(ProxyState::Tls(TlsState::Handshake(
+                TlsHandshakeState::HandshakeBegin,
+            )));
         }
 
         // -----------------------------------------------------------
@@ -358,10 +309,10 @@ pub async unsafe fn h1_handler(conn: &mut Connection, s: H1State) -> NextStep {
 
             // Decide which reader to use
             let mut_reader = conn.client_tls.unwrap();
-            println!("[H1] RecvHeaders1"); 
+            println!("[H1] RecvHeaders1");
             let mut buf = std::slice::from_raw_parts_mut(conn.in_buf.as_ptr(), conn.in_cap);
-            
-            println!("[H1] RecvHeaders2"); 
+
+            println!("[H1] RecvHeaders2");
             let n = match (*mut_reader).read(buf).await {
                 Ok(n) if n > 0 => {
                     conn.in_len = n;
@@ -370,259 +321,272 @@ pub async unsafe fn h1_handler(conn: &mut Connection, s: H1State) -> NextStep {
                 }
                 _ => return NextStep::Close,
             };
-            
 
             if twoway::find_bytes(&buf[..n], b"\r\n\r\n").is_some() {
                 println!("[H1] Headers complete");
-                return NextStep::Continue(ProxyState::Upstream(
-                    UpstreamState::Dns(UpstreamDnsState::ResolveStart)
-                ));
+                return NextStep::Continue(ProxyState::Upstream(UpstreamState::Dns(
+                    UpstreamDnsState::ResolveStart,
+                )));
             }
 
-            return NextStep::WaitClientRead;
+            return NextStep::WaitRead(ProxyState::H1(H1State::Request(
+                H1RequestParseState::RecvHeaders,
+            )));
         }
 
-//--------------------------------------------------------------
-// FORWARD REQUEST HEADERS (client → upstream)
-//--------------------------------------------------------------
-H1State::Forward(H1ForwardState::ForwardRequestHeaders) => {
-    println!("[H1] ForwardRequestHeaders");
+        //--------------------------------------------------------------
+        // FORWARD REQUEST HEADERS (client → upstream)
+        //--------------------------------------------------------------
+        H1State::Forward(H1ForwardState::ForwardRequestHeaders) => {
+            println!("[H1] ForwardRequestHeaders");
 
-    let buf = std::slice::from_raw_parts_mut(conn.in_buf.as_ptr(), conn.in_cap);
+            let buf = std::slice::from_raw_parts_mut(conn.in_buf.as_ptr(), conn.in_cap);
 
-    let n = conn.in_len;
-    println!("[H1] Req headers read {:?} bytes", n);
+            let n = conn.in_len;
+            println!("[H1] Req headers read {:?} bytes", n);
 
-    if let Some(ptr) = conn.upstream_tls {
-        let mut a = conn.upstream_tls.unwrap();
-        println!("[H1] Forward req, writing to upstream");
-        if let Err(e) = (*a).write_all(&buf[..n]).await {
-            println!("[H1] Forward req headers error: {}", e);
-            return NextStep::Close;
-        }
-    } else { 
-        let mut a = (conn.upstream_tcp.unwrap());
-        println!("[H1] Forward req, writing to tcp upstream");
-        if let Err(e) = (*a).write_all(&buf[..n]).await {
-            println!("[H1] Forward req headers error: {}", e);
-            return NextStep::Close;
-        }
-    };
-
-    
-
-    // End of request headers?
-    if twoway::find_bytes(&buf[..n], b"\r\n\r\n").is_some() {
-        println!("[H1] Request headers complete");
-        return NextStep::Continue(ProxyState::H1(
-            H1State::Forward(H1ForwardState::ForwardRequestBody)
-        ));
-    }
-
-    // continue collecting headers
-    NextStep::Continue(ProxyState::H1(
-        H1State::Forward(H1ForwardState::ForwardRequestHeaders)
-    ))
-}
-
-//--------------------------------------------------------------
-// FORWARD REQUEST BODY (client → upstream)
-//--------------------------------------------------------------
-H1State::Forward(H1ForwardState::ForwardRequestBody) => {
-    println!("[H1] ForwardRequestBody");
-
-    let reader: &mut (dyn AsyncRead + Unpin) = if let Some(ptr) = conn.client_tls {
-        &mut *(ptr as *mut TlsStream<TcpStream>)
-    } else {
-        &mut *(conn.client_tcp.unwrap() as *mut TcpStream)
-    };
-
-
-    let mut buf = std::slice::from_raw_parts_mut(conn.in_buf.as_ptr(), conn.in_cap);
-
-    let n = match reader.read(buf).await {
-        Ok(0) => {
-            println!("[H1] Req body EOF");
-            return NextStep::Continue(ProxyState::H1(
-                H1State::Forward(H1ForwardState::UpstreamRecvHeaders)
-            ));
-        }
-        Ok(n) => n,
-        Err(e) => {
-            println!("[H1] Req body read error: {}", e);
-            return NextStep::Close;
-        }
-    };
-
-      if let Some(ptr) = conn.upstream_tls {
-        let mut a = (conn.upstream_tls.unwrap());
-        if let Err(e) = (*a).write_all(&buf[..n]).await {
-            println!("[H1]  Req body write error: {}", e);
-            return NextStep::Close;
-        }
-    } else { 
-        let mut a = (conn.upstream_tcp.unwrap());
-        if let Err(e) = (*a).write_all(&buf[..n]).await {
-            println!("[H1]  Req body write error: {}", e);
-            return NextStep::Close;
-        }
-    };
-
-    NextStep::Continue(ProxyState::H1(
-        H1State::Forward(H1ForwardState::ForwardRequestBody)
-    ))
-}
-
-//--------------------------------------------------------------
-// UPSTREAM RECV RESPONSE HEADERS
-//--------------------------------------------------------------
-H1State::Forward(H1ForwardState::UpstreamRecvHeaders) => {
-    println!("[H1] UpstreamRecvHeaders");
-
-    let reader: &mut (dyn AsyncRead + Unpin) = if let Some(ptr) = conn.upstream_tls {
-        &mut *(ptr as *mut TlsStream<TcpStream>)
-    } else {
-        &mut *(conn.upstream_tcp.unwrap() as *mut TcpStream)
-    };
-
-    let buf = std::slice::from_raw_parts_mut(conn.in_buf.as_ptr(), conn.in_cap);
-
-    let n = match reader.read(buf).await {
-        Ok(n) if n > 0 => n,
-        _ => return NextStep::Close,
-    };
-
-    println!("[H1] Upstream response headers {} bytes", n);
-    conn.in_len = n;
-
-    return NextStep::Continue(ProxyState::H1(
-        H1State::Forward(H1ForwardState::SendResponseHeadersToClient)
-    ));
-}
-
-//--------------------------------------------------------------
-// SEND RESPONSE HEADERS TO CLIENT
-//--------------------------------------------------------------
-H1State::Forward(H1ForwardState::SendResponseHeadersToClient) => {
-    println!("[H1] SendResponseHeadersToClient");
-
-  
-
-    let buf =  std::slice::from_raw_parts_mut(conn.in_buf.as_ptr(), conn.in_cap); 
-
-    let n = conn.in_len;
-    if let Some(ptr) = conn.client_tls {
-        let mut a = (conn.client_tls.unwrap());
-        if let Err(e) = (*a).write_all(&buf[..n]).await {
-            println!("[H1]  Req body write error: {}", e);
-            return NextStep::Close;
-        }
-    } else { 
-        let mut a = (conn.client_tcp.unwrap());
-        if let Err(e) = (*a).write_all(&buf[..n]).await {
-            println!("[H1]  Req body write error: {}", e);
-            return NextStep::Close;
-        }
-    };
-
-    // Check if headers ended
-    if twoway::find_bytes(buf, b"\r\n\r\n").is_some() {
-        return NextStep::Continue(ProxyState::H1(
-            H1State::Forward(H1ForwardState::UpstreamRecvBody)
-        ));
-    }
-
-    NextStep::Close
-}
-
-//--------------------------------------------------------------
-// READ RESPONSE BODY FROM UPSTREAM
-//--------------------------------------------------------------
-H1State::Forward(H1ForwardState::UpstreamRecvBody) => {
-    println!("[H1] UpstreamRecvBody");
-    let mut buf = std::slice::from_raw_parts_mut(conn.in_buf.as_ptr(), conn.in_cap);
-    let mut v = 0;
-
-    if let Some(ptr) = conn.upstream_tls {
-      v =   match (*(conn.upstream_tls.unwrap())).read(&mut buf[conn.in_len..]).await {
-            Ok(0) => {
-                println!("[H1] Upstream body EOF");
-                return NextStep::Close;
-            }
-            Ok(n) => {
-                conn.in_len += n;
-                n
-            }
-            Err(e) => {
-                let err_str = e.to_string();
-            
-                if err_str.contains("peer closed connection without sending TLS close_notify") ||
-                   err_str.contains("UnexpectedEof") {
-                    // Treat as normal EOF
-                    println!("[H1] Upstream body EOF (TLS no close_notify)");
+            if let Some(ptr) = conn.upstream_tls {
+                let mut a = conn.upstream_tls.unwrap();
+                println!("[H1] Forward req, writing to upstream");
+                if let Err(e) = (*a).write_all(&buf[..n]).await {
+                    println!("[H1] Forward req headers error: {}", e);
                     return NextStep::Close;
                 }
-            
-                println!("[H1] Resp body1 read error: {}", e);
-                return NextStep::Close;
-            } 
-        };
-    } else {
-        match (*(conn.upstream_tcp.unwrap())).read(buf).await {
-            Ok(0) => {
-                println!("[H1] Upstream body EOF");
-                return NextStep::Close;
+            } else {
+                let mut a = (conn.upstream_tcp.unwrap());
+                println!("[H1] Forward req, writing to tcp upstream");
+                if let Err(e) = (*a).write_all(&buf[..n]).await {
+                    println!("[H1] Forward req headers error: {}", e);
+                    return NextStep::Close;
+                }
+            };
+
+            // End of request headers?
+            if twoway::find_bytes(&buf[..n], b"\r\n\r\n").is_some() {
+                println!("[H1] Request headers complete");
+                return NextStep::Continue(ProxyState::H1(H1State::Forward(
+                    H1ForwardState::ForwardRequestBody,
+                )));
             }
-            Ok(n) => {
-                conn.out_len = n;
-                n
-            }
-            Err(e) => {
-                println!("[H1] Resp body read error: {}", e);
-                return NextStep::Close;
-            }
-        };
-    }
 
-  
-
-    println!("[H1] BUffer written: {}/{}\n{:?}", conn.in_len, buf.len(), String::from_utf8(buf[..conn.in_len].to_vec()).unwrap());
-
-
-    return NextStep::Continue(ProxyState::H1(
-        H1State::Forward(H1ForwardState::SendResponseBodyToClient)
-    ));
-}
-
-//--------------------------------------------------------------
-// SEND RESPONSE BODY TO CLIENT
-//--------------------------------------------------------------
-H1State::Forward(H1ForwardState::SendResponseBodyToClient) => {
-    println!("[H1] SendResponseBodyToClient");
-
-    let buf =  std::slice::from_raw_parts_mut(conn.in_buf.as_ptr(), conn.in_cap);
-    println!("[H1] BUffer read: {}/{}\n{:?}", conn.in_len, buf.len(), String::from_utf8(buf[..conn.in_len].to_vec()).unwrap());
-
-    let n = conn.in_len;
-    if let Some(ptr) = conn.client_tls{
-        let mut a = (conn.client_tls.unwrap());
-        if let Err(e) = (*a).write_all(&buf[..n]).await {
-            println!("[H1]  Res body1 write error: {}", e);
-            return NextStep::Close;
+            // continue collecting headers
+            NextStep::Continue(ProxyState::H1(H1State::Forward(
+                H1ForwardState::ForwardRequestHeaders,
+            )))
         }
-    } else { 
-        let mut a = (conn.client_tcp.unwrap());
-        if let Err(e) = (*a).write_all(&buf[..n]).await {
-            println!("[H1]  Res body write error: {}", e);
-            return NextStep::Close;
-        }
-    };
 
-    // Continue body pump
-    return NextStep::Continue(ProxyState::H1(
-        H1State::Forward(H1ForwardState::UpstreamRecvBody)
-    ));
-}
+        //--------------------------------------------------------------
+        // FORWARD REQUEST BODY (client → upstream)
+        //--------------------------------------------------------------
+        H1State::Forward(H1ForwardState::ForwardRequestBody) => {
+            println!("[H1] ForwardRequestBody");
+
+            let reader: &mut (dyn AsyncRead + Unpin) = if let Some(ptr) = conn.client_tls {
+                &mut *(ptr as *mut TlsStream<TcpStream>)
+            } else {
+                &mut *(conn.client_tcp.unwrap() as *mut TcpStream)
+            };
+
+            let mut buf = std::slice::from_raw_parts_mut(conn.in_buf.as_ptr(), conn.in_cap);
+
+            let n = match reader.read(buf).await {
+                Ok(0) => {
+                    println!("[H1] Req body EOF");
+                    return NextStep::Continue(ProxyState::H1(H1State::Forward(
+                        H1ForwardState::UpstreamRecvHeaders,
+                    )));
+                }
+                Ok(n) => n,
+                Err(e) => {
+                    println!("[H1] Req body read error: {}", e);
+                    return NextStep::Close;
+                }
+            };
+
+            if let Some(ptr) = conn.upstream_tls {
+                let mut a = (conn.upstream_tls.unwrap());
+                if let Err(e) = (*a).write_all(&buf[..n]).await {
+                    println!("[H1]  Req body write error: {}", e);
+                    return NextStep::Close;
+                }
+            } else {
+                let mut a = (conn.upstream_tcp.unwrap());
+                if let Err(e) = (*a).write_all(&buf[..n]).await {
+                    println!("[H1]  Req body write error: {}", e);
+                    return NextStep::Close;
+                }
+            };
+
+            NextStep::Continue(ProxyState::H1(H1State::Forward(
+                H1ForwardState::ForwardRequestBody,
+            )))
+        }
+
+        //--------------------------------------------------------------
+        // UPSTREAM RECV RESPONSE HEADERS
+        //--------------------------------------------------------------
+        H1State::Forward(H1ForwardState::UpstreamRecvHeaders) => {
+            println!("[H1] UpstreamRecvHeaders");
+
+            let reader: &mut (dyn AsyncRead + Unpin) = if let Some(ptr) = conn.upstream_tls {
+                &mut *(ptr as *mut TlsStream<TcpStream>)
+            } else {
+                &mut *(conn.upstream_tcp.unwrap() as *mut TcpStream)
+            };
+
+            let buf = std::slice::from_raw_parts_mut(conn.in_buf.as_ptr(), conn.in_cap);
+
+            let n = match reader.read(buf).await {
+                Ok(n) if n > 0 => n,
+                _ => return NextStep::Close,
+            };
+
+            println!("[H1] Upstream response headers {} bytes", n);
+            conn.in_len = n;
+            if twoway::find_bytes(buf, b"\r\n\r\n").is_some() {
+                return NextStep::Continue(ProxyState::H1(H1State::Forward(
+                    H1ForwardState::SendResponseHeadersToClient,
+                )));
+            }
+
+            return NextStep::Continue(ProxyState::H1(H1State::Forward(
+                H1ForwardState::UpstreamRecvHeaders,
+            )));
+        }
+
+        //--------------------------------------------------------------
+        // SEND RESPONSE HEADERS TO CLIENT
+        //--------------------------------------------------------------
+        H1State::Forward(H1ForwardState::SendResponseHeadersToClient) => {
+            println!("[H1] SendResponseHeadersToClient");
+
+            let buf = std::slice::from_raw_parts_mut(conn.in_buf.as_ptr(), conn.in_cap);
+
+            let n = conn.in_len;
+            if let Some(ptr) = conn.client_tls {
+                let mut a = (conn.client_tls.unwrap());
+                if let Err(e) = (*a).write_all(&buf[..n]).await {
+                    println!("[H1]  Req body write error: {}", e);
+                    return NextStep::Close;
+                }
+            } else {
+                let mut a = (conn.client_tcp.unwrap());
+                if let Err(e) = (*a).write_all(&buf[..n]).await {
+                    println!("[H1]  Req body write error: {}", e);
+                    return NextStep::Close;
+                }
+            };
+
+            // Check if headers ended
+            if twoway::find_bytes(buf, b"\r\n\r\n").is_some() {
+                return NextStep::Continue(ProxyState::H1(H1State::Forward(
+                    H1ForwardState::UpstreamRecvBody,
+                )));
+            }
+
+            NextStep::Close
+        }
+
+        //--------------------------------------------------------------
+        // READ RESPONSE BODY FROM UPSTREAM
+        //--------------------------------------------------------------
+        H1State::Forward(H1ForwardState::UpstreamRecvBody) => {
+            println!("[H1] UpstreamRecvBody");
+            let mut buf = std::slice::from_raw_parts_mut(conn.in_buf.as_ptr(), conn.in_cap);
+            let mut v = 0;
+
+            if let Some(ptr) = conn.upstream_tls {
+                v = match (*(conn.upstream_tls.unwrap()))
+                    .read(&mut buf[conn.in_len..])
+                    .await
+                {
+                    Ok(0) => {
+                        println!("[H1] Upstream body EOF");
+                        return NextStep::Close;
+                    }
+                    Ok(n) => {
+                        conn.in_len += n;
+                        n
+                    }
+                    Err(e) => {
+                        let err_str = e.to_string();
+
+                        if err_str
+                            .contains("peer closed connection without sending TLS close_notify")
+                            || err_str.contains("UnexpectedEof")
+                        {
+                            // Treat as normal EOF
+                            println!("[H1] Upstream body EOF (TLS no close_notify)");
+                            return NextStep::Close;
+                        }
+
+                        println!("[H1] Resp body1 read error: {}", e);
+                        return NextStep::Close;
+                    }
+                };
+            } else {
+                match (*(conn.upstream_tcp.unwrap())).read(buf).await {
+                    Ok(0) => {
+                        println!("[H1] Upstream body EOF");
+                        return NextStep::Close;
+                    }
+                    Ok(n) => {
+                        conn.out_len = n;
+                        n
+                    }
+                    Err(e) => {
+                        println!("[H1] Resp body read error: {}", e);
+                        return NextStep::Close;
+                    }
+                };
+            }
+
+            println!(
+                "[H1] BUffer written: {}/{}\n{:?}",
+                conn.in_len,
+                buf.len(),
+                String::from_utf8(buf[..conn.in_len].to_vec()).unwrap()
+            );
+
+            return NextStep::Continue(ProxyState::H1(H1State::Forward(
+                H1ForwardState::SendResponseBodyToClient,
+            )));
+        }
+
+        //--------------------------------------------------------------
+        // SEND RESPONSE BODY TO CLIENT
+        //--------------------------------------------------------------
+        H1State::Forward(H1ForwardState::SendResponseBodyToClient) => {
+            println!("[H1] SendResponseBodyToClient");
+
+            let buf = std::slice::from_raw_parts_mut(conn.in_buf.as_ptr(), conn.in_cap);
+            println!(
+                "[H1] BUffer read: {}/{}\n{:?}",
+                conn.in_len,
+                buf.len(),
+                String::from_utf8(buf[..conn.in_len].to_vec()).unwrap()
+            );
+
+            let n = conn.in_len;
+            if let Some(ptr) = conn.client_tls {
+                let mut a = (conn.client_tls.unwrap());
+                if let Err(e) = (*a).write_all(&buf[..n]).await {
+                    println!("[H1]  Res body1 write error: {}", e);
+                    return NextStep::Close;
+                }
+            } else {
+                let mut a = (conn.client_tcp.unwrap());
+                if let Err(e) = (*a).write_all(&buf[..n]).await {
+                    println!("[H1]  Res body write error: {}", e);
+                    return NextStep::Close;
+                }
+            };
+
+            // Continue body pump
+            return NextStep::Continue(ProxyState::H1(H1State::Forward(
+                H1ForwardState::UpstreamRecvBody,
+            )));
+        }
 
         _ => {
             println!("[H1] Unhandled state");
@@ -630,7 +594,6 @@ H1State::Forward(H1ForwardState::SendResponseBodyToClient) => {
         }
     }
 }
-
 
 // ===============================================================
 // 5. UPSTREAM HANDLER – TCP + TLS handshake
@@ -640,14 +603,13 @@ pub async unsafe fn upstream_handler(conn: &mut Connection, s: UpstreamState) ->
     println!("[UPSTREAM] {:?}", s);
 
     match s {
-
         // ----------------------------------------------------------
         UpstreamState::Dns(UpstreamDnsState::ResolveStart) => {
             println!("[UPSTREAM] Dummy DNS resolution");
             conn.scratch = 443;
-            return NextStep::Continue(ProxyState::Upstream(
-                UpstreamState::Tcp(UpstreamTcpState::TcpConnectBegin)
-            ));
+            return NextStep::Continue(ProxyState::Upstream(UpstreamState::Tcp(
+                UpstreamTcpState::TcpConnectBegin,
+            )));
         }
 
         // ----------------------------------------------------------
@@ -656,12 +618,10 @@ pub async unsafe fn upstream_handler(conn: &mut Connection, s: UpstreamState) ->
 
             match TcpStream::connect("142.250.74.4:443").await {
                 Ok(s) => {
-                    conn.upstream_tcp = Some(
-                        Box::into_raw(Box::new(s)) as *mut _
-                    );
-                    return NextStep::Continue(ProxyState::Upstream(
-                        UpstreamState::Tls(UpstreamTlsState::TlsHandshakeBegin)
-                    ));
+                    conn.upstream_tcp = Some(Box::into_raw(Box::new(s)) as *mut _);
+                    return NextStep::Continue(ProxyState::Upstream(UpstreamState::Tls(
+                        UpstreamTlsState::TlsHandshakeBegin,
+                    )));
                 }
                 Err(_) => return NextStep::Close,
             }
@@ -678,13 +638,10 @@ pub async unsafe fn upstream_handler(conn: &mut Connection, s: UpstreamState) ->
 
             // Create empty store
 
-            
             let mut roots = RootCertStore::empty();
             let der_bytes = std::fs::read("/Users/michealkeines/Proyx/src/CA/root.der").unwrap();
             roots.add(CertificateDer::from(der_bytes)).unwrap();
             roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-            
-
 
             let cfg = ClientConfig::builder()
                 .with_root_certificates(roots)
@@ -696,20 +653,18 @@ pub async unsafe fn upstream_handler(conn: &mut Connection, s: UpstreamState) ->
 
             match connector.connect(domain, *tcp).await {
                 Ok(tls) => {
-                    conn.upstream_tls = Some(
-                        Box::into_raw(Box::new(tls))
-                    );
+                    conn.upstream_tls = Some(Box::into_raw(Box::new(tls)));
                     println!("TLS upstream done");
                     conn.upstream_tcp = None;
 
-                    return NextStep::Continue(ProxyState::H1(
-                        H1State::Forward(H1ForwardState::ForwardRequestHeaders)
-                    ));
+                    return NextStep::Continue(ProxyState::H1(H1State::Forward(
+                        H1ForwardState::ForwardRequestHeaders,
+                    )));
                 }
                 Err(err) => {
-                    println!("error: {:?}", err); 
-                    return NextStep::Close
-                },
+                    println!("error: {:?}", err);
+                    return NextStep::Close;
+                }
             }
         }
 
@@ -720,8 +675,6 @@ pub async unsafe fn upstream_handler(conn: &mut Connection, s: UpstreamState) ->
     }
 }
 
-
-
 // ===============================================================
 // STREAM HANDLER (not used yet)
 // ===============================================================
@@ -729,8 +682,6 @@ pub async unsafe fn upstream_handler(conn: &mut Connection, s: UpstreamState) ->
 pub async unsafe fn stream_handler(_: &mut Connection, _: StreamState) -> NextStep {
     NextStep::Close
 }
-
-
 
 // ===============================================================
 // SHUTDOWN HANDLER
@@ -740,8 +691,6 @@ pub async unsafe fn shutdown_handler(_: &mut Connection, _: ShutdownState) -> Ne
     println!("[SHUTDOWN]");
     NextStep::Close
 }
-
-
 
 // ===============================================================
 // UNUSED (but required):

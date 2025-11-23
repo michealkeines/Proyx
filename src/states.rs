@@ -1,3 +1,62 @@
+use std::ptr::NonNull;
+
+pub struct H1Session {
+    pub headers: NonNull<u8>,
+    pub body: Option<NonNull<u8>>,
+    pub headers_count: Option<u64>,
+    pub body_len: Option<u64>,
+    pub parsed_headers: bool,
+    pub parsed_body: bool,
+    pub content_len: Option<u64>,
+    pub is_chunked: bool,
+    pub keep_alive: bool,
+}
+
+impl H1Session {
+    pub unsafe fn allocate_body(&mut self) -> bool {
+        if (self.body_len.is_none()) {
+            return false;
+        }
+        let len = self.body_len.unwrap();
+        if (len == 0) {
+            return false;
+        }
+        let k = (64 * 1024) as u64;
+        if (len > k) {
+            println!("BODY SIZE is too big\n");
+            return false;
+        }
+
+        self.body = {
+            let raw = std::alloc::alloc_zeroed(
+                std::alloc::Layout::from_size_align(len as usize, 32).unwrap(),
+            );
+            Some(NonNull::new(raw).expect("failed alloc headers buf"))
+        };
+
+        return true;
+    }
+    pub unsafe fn new() -> H1Session {
+        let in_cap = 64 * 1024;
+        let headers = {
+            let raw =
+                std::alloc::alloc_zeroed(std::alloc::Layout::from_size_align(in_cap, 32).unwrap());
+            NonNull::new(raw).expect("failed alloc headers buf")
+        };
+        Self {
+            headers: headers,
+            body: None,
+            headers_count: None,
+            body_len: None,
+            parsed_body: false,
+            parsed_headers: false,
+            content_len: None,
+            is_chunked: false,
+            keep_alive: false,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProxyState {
     Transport(TransportState),
@@ -20,13 +79,11 @@ pub enum TransportConnState {
     ClientTcpEstablished,
 }
 
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransportIoState {
     ClientReadInitialData,
     ClientWritePendingData,
 }
-
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransportDetectState {
@@ -35,13 +92,11 @@ pub enum TransportDetectState {
     ClientDetectProtocolGuess,
 }
 
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransportKeepaliveState {
     ClientKeepAliveIdle,
     ClientKeepAliveTimeout,
 }
-
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransportState {
@@ -79,7 +134,6 @@ pub enum TlsRenegotiationState {
     RenegotiationComplete,
 }
 
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TlsShutdownState {
     ShutdownBegin,
@@ -111,14 +165,14 @@ pub enum QuicZeroRttState {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QuicHandshakeState {
-    CryptoSetup,          // parse CRYPTO frames
-    Handshake,            // handshake keys in progress
-    HandshakeConfirmed,   // handshake keys confirmed
+    CryptoSetup,        // parse CRYPTO frames
+    Handshake,          // handshake keys in progress
+    HandshakeConfirmed, // handshake keys confirmed
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QuicReadyState {
-    TransportReady,   // 1-RTT keys active, streams can open
+    TransportReady, // 1-RTT keys active, streams can open
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -298,19 +352,16 @@ pub enum H2UpstreamConnectState {
     UpstreamTlsHandshakeComplete,
 }
 
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum H2UpstreamSettingsState {
     UpstreamSettingsExchange,
 }
-
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum H2ProxyState {
     ProxyFramesClientToUpstream,
     ProxyFramesUpstreamToClient,
 }
-
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum H2FlowControlState {
@@ -323,7 +374,6 @@ pub enum H2StreamLifecycleState {
     StreamHalfClosedLocal,
     StreamClosed,
 }
-
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum H2ControlState {
@@ -396,7 +446,6 @@ pub enum H3UpstreamState {
     UpstreamQuicReady,
 }
 
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum H3ForwardState {
     ForwardHeaders,
@@ -413,7 +462,6 @@ pub enum H3StreamLifecycleState {
 pub enum H3SessionState {
     FinalizeConnection,
 }
-
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum H3State {
@@ -438,8 +486,6 @@ pub enum H3State {
 
     Session(H3SessionState),
 }
-
-
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InterceptPipelineState {
@@ -565,7 +611,6 @@ pub enum StreamTerminationState {
     StreamTlsShutdown,
     StreamQuicFin,
 }
-
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StreamState {

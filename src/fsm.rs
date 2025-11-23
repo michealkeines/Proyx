@@ -6,16 +6,10 @@ pub enum NextStep {
     Continue(ProxyState),
 
     /// Suspend until client socket readable
-    WaitClientRead,
+    WaitRead(ProxyState),
 
     /// Suspend until client socket writable
-    WaitClientWrite,
-
-    /// Suspend until upstream socket readable
-    WaitUpstreamRead,
-
-    /// Suspend until upstream socket writable
-    WaitUpstreamWrite,
+    WaitWrite(ProxyState),
 
     /// Suspend waiting for controller (interceptor)
     WaitController,
@@ -26,5 +20,3 @@ pub enum NextStep {
     /// Fatal: close connection immediately
     Close,
 }
-
-

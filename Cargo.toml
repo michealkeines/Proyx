@@ -17,4 +17,4 @@ webpki-roots = "0.26.3"
 rcgen = "0.14.5"
 openssl = "0.10"
 rustls-pki-types = "1"
-
+hpack = "0.3"

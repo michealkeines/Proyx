@@ -11,7 +11,7 @@ use crate::{
 };
 
 use tokio::{
-    io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, copy_bidirectional},
     net::TcpStream,
 };
 
@@ -170,10 +170,11 @@ pub async unsafe fn tls_handler(conn: &mut Connection, s: TlsState) -> NextStep 
             let (leaf_cert, leaf_key) = build_fake_cert_for_domain(&sni);
 
             // --- Install into rustls server config ---
-            let server_cfg = ServerConfig::builder()
+            let mut server_cfg = ServerConfig::builder()
                 .with_no_client_auth()
                 .with_single_cert(vec![leaf_cert], leaf_key)
                 .unwrap();
+            server_cfg.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
 
             let mut acceptor = Box::into_raw(Box::new(TlsAcceptor::from(Arc::new(server_cfg))));
             conn.scratch = acceptor as u64;
@@ -226,8 +227,24 @@ pub async unsafe fn tls_handler(conn: &mut Connection, s: TlsState) -> NextStep 
         TlsState::Handshake(TlsHandshakeState::HandshakeComplete) => {
             println!("[TLS] Client TLS Handshake Complete");
 
+            if let Some(ptr) = conn.client_tls {
+                let tls_stream = &*ptr;
+                let (_, server_conn) = tls_stream.get_ref();
+                if let Some(proto) = server_conn.alpn_protocol() {
+                    conn.negotiated_alpn = Some(String::from_utf8_lossy(proto).to_string());
+                }
+            }
+
             unsafe {
                 conn.fill_target_from_tls_sni(443);
+            }
+
+            if let Some(alpn) = &conn.negotiated_alpn {
+                if alpn == "h2" {
+                    return NextStep::Continue(ProxyState::H2(H2State::Bootstrap(
+                        H2ConnBootstrapState::ClientPreface,
+                    )));
+                }
             }
 
             return NextStep::Continue(ProxyState::H1(H1State::Request(
@@ -318,16 +335,56 @@ pub async unsafe fn h1_handler(conn: &mut Connection, s: H1State) -> NextStep {
         // CONNECT tunnel establishment
         // -----------------------------------------------------------
         H1State::Connect(H1ConnectState::ConnectTunnelEstablished) => {
-            println!("[H1] CONNECT: returning 200");
+            println!("[H1] CONNECT: parsing target and dialing upstream");
 
-            let tcp = conn.client_tcp.unwrap();
-            let _ = (*tcp)
-                .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
-                .await;
+            let buf = std::slice::from_raw_parts_mut(conn.in_buf.as_ptr(), conn.in_cap);
+            let n = match read_client_data(conn, buf).await {
+                Ok(n) if n > 0 => {
+                    conn.in_len = n;
+                    n
+                }
+                _ => return NextStep::Close,
+            };
 
-            return NextStep::Continue(ProxyState::Tls(TlsState::Handshake(
-                TlsHandshakeState::HandshakeBegin,
+            let target = match parse_connect_target(&buf[..n], 443) {
+                Some(t) => t,
+                None => {
+                    println!("[H1] Invalid CONNECT request line");
+                    return NextStep::Close;
+                }
+            };
+
+            conn.set_target(target.0, target.1);
+            conn.upstream_tls_required = false;
+            conn.connect_response_sent = false;
+            conn.next_state_after_upstream = Some(ProxyState::H1(H1State::Connect(
+                H1ConnectState::ConnectTunnelTransfer,
             )));
+
+            return NextStep::Continue(ProxyState::Upstream(UpstreamState::Dns(
+                UpstreamDnsState::ResolveStart,
+            )));
+        }
+
+        H1State::Connect(H1ConnectState::ConnectTunnelTransfer) => {
+            if conn.upstream_tcp.is_none() && conn.upstream_tls.is_none() {
+                println!("[H1] CONNECT tunnel waiting for upstream socket");
+                return NextStep::Continue(ProxyState::Upstream(UpstreamState::Dns(
+                    UpstreamDnsState::ResolveStart,
+                )));
+            }
+
+            if !conn.connect_response_sent {
+                let _ = write_client_data(
+                    conn,
+                    b"HTTP/1.1 200 Connection Established\r\n\r\n",
+                )
+                .await;
+                conn.connect_response_sent = true;
+            }
+
+            let _ = tunnel_copy(conn).await;
+            return NextStep::Close;
         }
 
         // -----------------------------------------------------------
@@ -363,9 +420,26 @@ pub async unsafe fn h1_handler(conn: &mut Connection, s: H1State) -> NextStep {
                     conn.next_state_after_upstream.is_none(),
                     "[H1] next_state_after_upstream should not be set before headers complete"
                 );
+                if let Some((method, path)) = parse_request_line(&buf[..n]) {
+                    if method.eq_ignore_ascii_case("CONNECT") {
+                        println!("[H1] CONNECT detected in TLS request");
+                        let (host, port) = split_host_port(&path, 443);
+                        conn.set_target(host, port);
+                        conn.upstream_tls_required = false;
+                        conn.connect_response_sent = false;
+                        conn.next_state_after_upstream = Some(ProxyState::H1(H1State::Connect(
+                            H1ConnectState::ConnectTunnelTransfer,
+                        )));
+                        return NextStep::Continue(ProxyState::Upstream(UpstreamState::Dns(
+                            UpstreamDnsState::ResolveStart,
+                        )));
+                    }
+                }
+
                 if let Some((host, port)) = parse_host_header(&buf[..n], 443) {
                     conn.set_target(host, port);
                 }
+                conn.upstream_tls_required = true;
                 conn.next_state_after_upstream = Some(ProxyState::H1(H1State::Forward(
                     H1ForwardState::ForwardRequestHeaders,
                 )));
@@ -704,6 +778,12 @@ pub async unsafe fn upstream_handler(conn: &mut Connection, s: UpstreamState) ->
             match TcpStream::connect(addr.as_str()).await {
                 Ok(s) => {
                     conn.upstream_tcp = Some(Box::into_raw(Box::new(s)) as *mut _);
+                    if !conn.upstream_tls_required {
+                        if let Some(next) = conn.next_state_after_upstream.take() {
+                            return NextStep::Continue(next);
+                        }
+                        return NextStep::Close;
+                    }
                     return NextStep::Continue(ProxyState::Upstream(UpstreamState::Tls(
                         UpstreamTlsState::TlsHandshakeBegin,
                     )));
@@ -835,31 +915,35 @@ pub async unsafe fn h2_handler(conn: &mut Connection, s: H2State) -> NextStep {
         }
 
         H2State::Bootstrap(H2ConnBootstrapState::RecvClientSettings) => {
-            match read_client_data(conn, buf).await {
-                Ok(n) if n > 0 => {
-                    conn.in_len = n;
-                    println!("[H2] Client settings {} bytes", n);
-                    conn.next_state_after_upstream = Some(ProxyState::H2(H2State::FrameParse(
-                        H2FrameParseState::RecvFrameHeader,
-                    )));
-                    return NextStep::Continue(ProxyState::Upstream(UpstreamState::Dns(
-                        UpstreamDnsState::ResolveStart,
-                    )));
+            let n = if conn.in_len > 0 {
+                conn.in_len
+            } else {
+                match read_client_data(conn, buf).await {
+                    Ok(n) if n > 0 => n,
+                    _ => return NextStep::Close,
                 }
-                _ => return NextStep::Close,
-            }
+            };
+            conn.in_len = n;
+            println!("[H2] Client settings {} bytes", n);
+            return NextStep::Continue(ProxyState::H2(H2State::FrameParse(
+                H2FrameParseState::RecvFrameHeader,
+            )));
         }
 
         H2State::FrameParse(H2FrameParseState::RecvFrameHeader) => {
-            let n = match read_client_data(conn, buf).await {
-                Ok(n) if n > 0 => n,
-                Ok(_) => {
-                    println!("[H2] Client closed during frame header");
-                    return NextStep::Close;
-                }
-                Err(e) => {
-                    println!("[H2] Frame header read error: {}", e);
-                    return NextStep::Close;
+            let n = if conn.in_len >= 9 {
+                conn.in_len
+            } else {
+                match read_client_data(conn, buf).await {
+                    Ok(n) if n > 0 => n,
+                    Ok(_) => {
+                        println!("[H2] Client closed during frame header");
+                        return NextStep::Close;
+                    }
+                    Err(e) => {
+                        println!("[H2] Frame header read error: {}", e);
+                        return NextStep::Close;
+                    }
                 }
             };
 
@@ -876,7 +960,7 @@ pub async unsafe fn h2_handler(conn: &mut Connection, s: H2State) -> NextStep {
                 frame.length, frame.kind, frame.flags, frame.stream_id
             );
 
-            conn.scratch = frame.length as u64;
+            conn.scratch = ((frame.stream_id as u64) << 32) | frame.length as u64;
 
             return NextStep::Continue(ProxyState::H2(H2State::FlowControl(
                 H2FlowControlState::FlowControlWaitWindowUpdate,
@@ -884,7 +968,8 @@ pub async unsafe fn h2_handler(conn: &mut Connection, s: H2State) -> NextStep {
         }
 
         H2State::FlowControl(H2FlowControlState::FlowControlWaitWindowUpdate) => {
-            let payload_len = conn.scratch as usize;
+            let payload_len = (conn.scratch & 0xffff_ffff) as usize;
+            let stream_id = (conn.scratch >> 32) as u32;
             if payload_len + 9 > conn.in_len {
                 println!(
                     "[H2] Frame payload truncated (expected {} + 9, got {})",
@@ -893,10 +978,45 @@ pub async unsafe fn h2_handler(conn: &mut Connection, s: H2State) -> NextStep {
                 return NextStep::Close;
             }
 
-            println!(
-                "[H2] Flow-control check for payload {} bytes (window update pending)",
-                payload_len
-            );
+            let frame = parse_h2_frame_header(&buf[..9]);
+            if frame.kind == 0x1 {
+                if let Some((method, host, port)) =
+                    parse_h2_pseudo_headers(&buf[9..9 + payload_len], 443)
+                {
+                    if method.eq_ignore_ascii_case("CONNECT") {
+                        println!("[H2] CONNECT detected on stream {}", stream_id);
+                        conn.set_target(host, port);
+                        conn.upstream_tls_required = false;
+                        conn.connect_response_sent = false;
+                        conn.h2_connect_stream_id = Some(stream_id);
+                        conn.next_state_after_upstream =
+                            Some(ProxyState::H2(H2State::Proxy(
+                                H2ProxyState::ProxyFramesClientToUpstream,
+                            )));
+                        conn.in_len = 0; // do not forward CONNECT headers upstream
+                        return NextStep::Continue(ProxyState::Upstream(UpstreamState::Dns(
+                            UpstreamDnsState::ResolveStart,
+                        )));
+                    } else {
+                        if conn.target().is_none() {
+                            conn.set_target(host, port);
+                        }
+                        conn.next_state_after_upstream =
+                            Some(ProxyState::H2(H2State::Proxy(
+                                H2ProxyState::ProxyFramesClientToUpstream,
+                            )));
+                        return NextStep::Continue(ProxyState::Upstream(UpstreamState::Dns(
+                            UpstreamDnsState::ResolveStart,
+                        )));
+                    }
+                }
+            }
+
+            if conn.next_state_after_upstream.is_none() {
+                conn.next_state_after_upstream = Some(ProxyState::H2(H2State::Proxy(
+                    H2ProxyState::ProxyFramesClientToUpstream,
+                )));
+            }
 
             return NextStep::Continue(ProxyState::H2(H2State::Proxy(
                 H2ProxyState::ProxyFramesClientToUpstream,
@@ -904,7 +1024,49 @@ pub async unsafe fn h2_handler(conn: &mut Connection, s: H2State) -> NextStep {
         }
 
         H2State::Proxy(H2ProxyState::ProxyFramesClientToUpstream) => {
-            let n = conn.in_len;
+            let mut n = conn.in_len;
+            if n == 0 {
+                match read_client_data(conn, buf).await {
+                    Ok(read) if read > 0 => {
+                        conn.in_len = read;
+                        n = read;
+                    }
+                    _ => return NextStep::Close,
+                }
+            }
+
+            if let Some(stream_id) = conn.h2_connect_stream_id {
+                if !conn.connect_response_sent {
+                    if let Err(e) = send_h2_connect_response(conn, stream_id).await {
+                        println!("[H2] Failed to send CONNECT response: {}", e);
+                        return NextStep::Close;
+                    }
+                    conn.connect_response_sent = true;
+                }
+
+                if n < 9 {
+                    println!("[H2] CONNECT frame too small");
+                    return NextStep::Close;
+                }
+                let frame = parse_h2_frame_header(&buf[..9]);
+                if frame.kind == 0x0 && frame.stream_id == stream_id {
+                    let payload_len = frame.length.min(n.saturating_sub(9));
+                    let start = 9;
+                    let end = start + payload_len;
+                    if payload_len > 0 {
+                        if let Err(e) = write_upstream_data(conn, &buf[start..end]).await {
+                            println!("[H2] CONNECT payload write failed: {}", e);
+                            return NextStep::Close;
+                        }
+                    }
+                }
+
+                conn.in_len = 0;
+                return NextStep::Continue(ProxyState::H2(H2State::Proxy(
+                    H2ProxyState::ProxyFramesUpstreamToClient,
+                )));
+            }
+
             if let Err(e) = write_upstream_data(conn, &buf[..n]).await {
                 println!("[H2] Client->upstream write failed: {}", e);
                 return NextStep::Close;
@@ -916,6 +1078,32 @@ pub async unsafe fn h2_handler(conn: &mut Connection, s: H2State) -> NextStep {
         }
 
         H2State::Proxy(H2ProxyState::ProxyFramesUpstreamToClient) => {
+            if let Some(stream_id) = conn.h2_connect_stream_id {
+                let n = match read_upstream_data(conn, buf).await {
+                    Ok(n) => n,
+                    Err(e) => {
+                        println!("[H2] Upstream read error: {}", e);
+                        return NextStep::Close;
+                    }
+                };
+
+                if n == 0 {
+                    let end_frame = build_h2_data_frame(stream_id, &[], true);
+                    let _ = write_client_data(conn, &end_frame).await;
+                    return NextStep::Close;
+                }
+
+                let frame = build_h2_data_frame(stream_id, &buf[..n], false);
+                if let Err(e) = write_client_data(conn, &frame).await {
+                    println!("[H2] Upstream->client write failed: {}", e);
+                    return NextStep::Close;
+                }
+
+                return NextStep::Continue(ProxyState::H2(H2State::FrameParse(
+                    H2FrameParseState::RecvFrameHeader,
+                )));
+            }
+
             let n = match read_upstream_data(conn, buf).await {
                 Ok(n) if n > 0 => n,
                 Ok(_) => {
@@ -983,6 +1171,18 @@ pub async unsafe fn h3_handler(conn: &mut Connection, s: H3State) -> NextStep {
             };
 
             conn.in_len = n;
+            if let Some((host, port)) = parse_connect_target(&buf[..n], 443) {
+                println!("[H3] CONNECT detected");
+                conn.set_target(host, port);
+                conn.upstream_tls_required = false;
+                conn.connect_response_sent = false;
+                conn.next_state_after_upstream = Some(ProxyState::H3(H3State::Session(
+                    H3SessionState::FinalizeConnection,
+                )));
+                return NextStep::Continue(ProxyState::Upstream(UpstreamState::Dns(
+                    UpstreamDnsState::ResolveStart,
+                )));
+            }
             println!("[H3] Parsed headers {} bytes", n);
             return NextStep::Continue(ProxyState::H3(H3State::Qpack(
                 H3QpackState::QpackDecodeHeaders,
@@ -1035,6 +1235,26 @@ pub async unsafe fn h3_handler(conn: &mut Connection, s: H3State) -> NextStep {
             return NextStep::Continue(ProxyState::H3(H3State::RequestParse(
                 H3RequestParseState::RecvHeaders,
             )));
+        }
+
+        H3State::Session(H3SessionState::FinalizeConnection) => {
+            if conn.upstream_tcp.is_none() && conn.upstream_tls.is_none() {
+                return NextStep::Continue(ProxyState::Upstream(UpstreamState::Dns(
+                    UpstreamDnsState::ResolveStart,
+                )));
+            }
+
+            if !conn.connect_response_sent {
+                let _ = write_client_data(
+                    conn,
+                    b"HTTP/1.1 200 Connection Established\r\n\r\n",
+                )
+                .await;
+                conn.connect_response_sent = true;
+            }
+
+            let _ = tunnel_copy(conn).await;
+            return NextStep::Close;
         }
 
         _ => {
@@ -1109,6 +1329,78 @@ async unsafe fn write_upstream_data(conn: &mut Connection, data: &[u8]) -> std::
     }
 }
 
+async unsafe fn tunnel_copy(conn: &mut Connection) -> std::io::Result<()> {
+    match (
+        conn.client_tls.as_mut(),
+        conn.client_tcp.as_mut(),
+        conn.upstream_tls.as_mut(),
+        conn.upstream_tcp.as_mut(),
+    ) {
+        (Some(c_tls), _, Some(u_tls), _) => copy_bidirectional(&mut **c_tls, &mut **u_tls).await.map(|_| ()),
+        (Some(c_tls), _, _, Some(u_tcp)) => copy_bidirectional(&mut **c_tls, &mut **u_tcp).await.map(|_| ()),
+        (_, Some(c_tcp), Some(u_tls), _) => copy_bidirectional(&mut **c_tcp, &mut **u_tls).await.map(|_| ()),
+        (_, Some(c_tcp), _, Some(u_tcp)) => copy_bidirectional(&mut **c_tcp, &mut **u_tcp).await.map(|_| ()),
+        _ => Err(Error::new(
+            ErrorKind::NotConnected,
+            "missing streams for CONNECT tunnel",
+        )),
+    }
+}
+
+fn parse_connect_target(buf: &[u8], default_port: u16) -> Option<(String, u16)> {
+    let line_end = twoway::find_bytes(buf, b"\r\n").unwrap_or(buf.len());
+    let line = std::str::from_utf8(&buf[..line_end]).ok()?;
+    let mut parts = line.split_whitespace();
+    let method = parts.next()?;
+    if !method.eq_ignore_ascii_case("CONNECT") {
+        return None;
+    }
+    let authority = parts.next()?;
+    Some(split_host_port(authority, default_port))
+}
+
+fn parse_request_line(buf: &[u8]) -> Option<(String, String)> {
+    let mut headers = [httparse::EMPTY_HEADER; 32];
+    let mut req = Request::new(&mut headers);
+    if let Ok(Status::Complete(_)) = req.parse(buf) {
+        if let (Some(method), Some(path)) = (req.method, req.path) {
+            return Some((method.to_string(), path.to_string()));
+        }
+    }
+    None
+}
+
+fn parse_h2_pseudo_headers(
+    payload: &[u8],
+    default_port: u16,
+) -> Option<(String, String, u16)> {
+    let text = std::str::from_utf8(payload).ok()?;
+    let mut method: Option<String> = None;
+    let mut authority: Option<String> = None;
+
+    for line in text.lines() {
+        let line = line.trim();
+        if line.starts_with(":method") {
+            if let Some(value) = line.split_whitespace().nth(1) {
+                method = Some(value.to_string());
+            } else if let Some((_, v)) = line.split_once(':') {
+                method = Some(v.trim().to_string());
+            }
+        } else if line.starts_with(":authority") {
+            if let Some(value) = line.split_whitespace().nth(1) {
+                authority = Some(value.to_string());
+            } else if let Some((_, v)) = line.split_once(':') {
+                authority = Some(v.trim().to_string());
+            }
+        }
+    }
+
+    let method = method?;
+    let authority = authority?;
+    let (host, port) = split_host_port(&authority, default_port);
+    Some((method, host, port))
+}
+
 fn parse_host_header(buf: &[u8], default_port: u16) -> Option<(String, u16)> {
     let mut headers = [httparse::EMPTY_HEADER; 64];
     let mut req = Request::new(&mut headers);
@@ -1176,6 +1468,41 @@ fn parse_h2_frame_header(buf: &[u8]) -> H2Frame {
         flags,
         stream_id,
     }
+}
+
+fn build_h2_frame_header(len: usize, kind: u8, flags: u8, stream_id: u32) -> [u8; 9] {
+    let length = len.min(0x00FF_FFFF);
+    [
+        ((length >> 16) & 0xff) as u8,
+        ((length >> 8) & 0xff) as u8,
+        (length & 0xff) as u8,
+        kind,
+        flags,
+        ((stream_id >> 24) & 0x7F) as u8,
+        ((stream_id >> 16) & 0xff) as u8,
+        ((stream_id >> 8) & 0xff) as u8,
+        (stream_id & 0xff) as u8,
+    ]
+}
+
+async unsafe fn send_h2_connect_response(
+    conn: &mut Connection,
+    stream_id: u32,
+) -> std::io::Result<()> {
+    // HEADERS frame with indexed static table entry :status 200 (0x88)
+    let mut frame = Vec::with_capacity(10);
+    frame.extend_from_slice(&build_h2_frame_header(1, 0x1, 0x4, stream_id));
+    frame.push(0x88);
+    write_client_data(conn, &frame).await
+}
+
+fn build_h2_data_frame(stream_id: u32, payload: &[u8], end_stream: bool) -> Vec<u8> {
+    let len = payload.len().min(0x00FF_FFFF);
+    let mut frame = Vec::with_capacity(9 + len);
+    let flags = if end_stream { 0x1 } else { 0x0 };
+    frame.extend_from_slice(&build_h2_frame_header(len, 0x0, flags, stream_id));
+    frame.extend_from_slice(&payload[..len]);
+    frame
 }
 
 pub async unsafe fn intercept_handler(_: &mut Connection, _: InterceptState) -> NextStep {
@@ -1266,16 +1593,10 @@ SM
         };
         assert!(matches!(
             step,
-            NextStep::Continue(ProxyState::Upstream(UpstreamState::Dns(
-                UpstreamDnsState::ResolveStart
-            )))
-        ));
-        assert_eq!(
-            conn.next_state_after_upstream,
-            Some(ProxyState::H2(H2State::FrameParse(
+            NextStep::Continue(ProxyState::H2(H2State::FrameParse(
                 H2FrameParseState::RecvFrameHeader
             )))
-        );
+        ));
 
         let payload = b"client->upstream";
         let frame = build_h2_frame(payload);
@@ -1308,6 +1629,12 @@ SM
                 H2ProxyState::ProxyFramesClientToUpstream
             )))
         ));
+        assert_eq!(
+            conn.next_state_after_upstream,
+            Some(ProxyState::H2(H2State::Proxy(
+                H2ProxyState::ProxyFramesClientToUpstream
+            )))
+        );
 
         let step = unsafe {
             h2_handler(

@@ -103,6 +103,10 @@ pub struct Connection {
 
     pub next_state_after_upstream: Option<ProxyState>,
     pub target_addr: Option<TargetAddr>,
+    pub upstream_tls_required: bool,
+    pub connect_response_sent: bool,
+    pub h2_connect_stream_id: Option<u32>,
+    pub negotiated_alpn: Option<String>,
 
     pub in_buf: NonNull<u8>,
     pub in_cap: usize,
@@ -221,6 +225,10 @@ impl Connection {
             scratch: 0,
             next_state_after_upstream: None,
             target_addr: None,
+            upstream_tls_required: true,
+            connect_response_sent: false,
+            h2_connect_stream_id: None,
+            negotiated_alpn: None,
             last_activity: std::time::Instant::now(),
         }
     }

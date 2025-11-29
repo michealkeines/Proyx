@@ -1,16 +1,15 @@
-use tokio::net::{TcpListener, UdpSocket, TcpStream};
 use futures::future;
+use tokio::net::{TcpListener, TcpStream, UdpSocket};
 
 use crate::{
     connection::Connection,
     fsm::NextStep,
-    scheduling::schedule_next,
-    states::{ProxyState, TransportState, TransportConnState, QuicState, QuicInitialState},
     scheduling::ConnPtr,
+    scheduling::schedule_next,
+    states::{ProxyState, QuicInitialState, QuicState, TransportConnState, TransportState},
 };
 
-use std::{ptr, mem, net::SocketAddr};
-
+use std::{mem, net::SocketAddr, ptr};
 
 //
 // ============================================================
@@ -26,7 +25,6 @@ pub struct QuicNode {
 }
 
 static mut QUIC_LIST: *mut QuicNode = ptr::null_mut();
-
 
 /// Lookup QUIC CID in intrusive list
 pub unsafe fn quic_lookup(cid: u64) -> Option<ConnPtr> {
@@ -75,8 +73,6 @@ pub unsafe fn quic_remove(cid: u64) {
     }
 }
 
-
-
 //
 // ============================================================
 //   MAIN LISTENER
@@ -110,8 +106,6 @@ pub async unsafe fn run_main_listener(addr: &str) -> std::io::Result<()> {
     Ok(())
 }
 
-
-
 //
 // ============================================================
 //   TCP ACCEPT LOOP
@@ -134,23 +128,17 @@ async unsafe fn tcp_accept_loop(listener: TcpListener) {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
 
         // Allocate Connection → *mut Connection
-        let conn: ConnPtr = Box::into_raw(Box::new(
-            Connection::new_tcp_raw(raw_tcp_ptr, tx, rx),
-        ));
+        let conn: ConnPtr = Box::into_raw(Box::new(Connection::new_tcp_raw(raw_tcp_ptr, tx, rx)));
 
         // Kick FSM
         schedule_next(
             conn,
-            NextStep::Continue(
-                ProxyState::Transport(
-                    TransportState::Conn(TransportConnState::AcceptClientConnection)
-                )
-            )
+            NextStep::Continue(ProxyState::Transport(TransportState::Conn(
+                TransportConnState::AcceptClientConnection,
+            ))),
         );
     }
 }
-
-
 
 //
 // ============================================================
@@ -184,9 +172,12 @@ async unsafe fn udp_quic_receive_loop(udp_socket_ptr: *mut UdpSocket) {
             None => {
                 let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
 
-                let conn_ptr: ConnPtr = Box::into_raw(Box::new(
-                    Connection::new_udp_raw(peer, udp_socket_ptr, tx, rx)
-                ));
+                let conn_ptr: ConnPtr = Box::into_raw(Box::new(Connection::new_udp_raw(
+                    peer,
+                    udp_socket_ptr,
+                    tx,
+                    rx,
+                )));
 
                 // Insert into intrusive list
                 quic_insert(dcid, conn_ptr);
@@ -194,11 +185,9 @@ async unsafe fn udp_quic_receive_loop(udp_socket_ptr: *mut UdpSocket) {
                 // Kick FSM start
                 schedule_next(
                     conn_ptr,
-                    NextStep::Continue(
-                        ProxyState::Quic(
-                            QuicState::Initial(QuicInitialState::InitialPacket)
-                        )
-                    )
+                    NextStep::Continue(ProxyState::Quic(QuicState::Initial(
+                        QuicInitialState::InitialPacket,
+                    ))),
                 );
 
                 conn_ptr
@@ -213,16 +202,12 @@ async unsafe fn udp_quic_receive_loop(udp_socket_ptr: *mut UdpSocket) {
         // Continue FSM
         schedule_next(
             conn,
-            NextStep::Continue(
-                ProxyState::Quic(
-                    QuicState::Initial(QuicInitialState::InitialPacket)
-                )
-            )
+            NextStep::Continue(ProxyState::Quic(QuicState::Initial(
+                QuicInitialState::InitialPacket,
+            ))),
         );
     }
 }
-
-
 
 //
 // ============================================================

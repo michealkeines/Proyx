@@ -44,6 +44,22 @@ pub enum WriteEnum {
     Udp(*mut UdpSocket),
 }
 
+#[derive(Debug, Clone)]
+pub struct TargetAddr {
+    pub host: String,
+    pub port: u16,
+}
+
+impl TargetAddr {
+    pub fn socket_addr(&self) -> String {
+        if self.host.contains(':') && !self.host.starts_with('[') {
+            format!("[{}]:{}", self.host, self.port)
+        } else {
+            format!("{}:{}", self.host, self.port)
+        }
+    }
+}
+
 impl WriteEnum {
     pub async unsafe fn writable(&mut self) -> std::io::Result<()> {
         match self {
@@ -84,6 +100,9 @@ pub struct Connection {
 
     pub client_h1_state: H1Session,
     pub upstream_h1_state: H1Session,
+
+    pub next_state_after_upstream: Option<ProxyState>,
+    pub target_addr: Option<TargetAddr>,
 
     pub in_buf: NonNull<u8>,
     pub in_cap: usize,
@@ -200,6 +219,8 @@ impl Connection {
 
             // misc
             scratch: 0,
+            next_state_after_upstream: None,
+            target_addr: None,
             last_activity: std::time::Instant::now(),
         }
     }
@@ -208,6 +229,34 @@ impl Connection {
         let len = pkt.len().min(self.in_cap);
         std::ptr::copy_nonoverlapping(pkt.as_ptr(), self.in_buf.as_ptr(), len);
         self.in_len = len;
+    }
+}
+
+impl Connection {
+    pub fn set_target(&mut self, host: String, port: u16) {
+        self.target_addr = Some(TargetAddr { host, port });
+    }
+
+    pub fn target(&self) -> Option<&TargetAddr> {
+        self.target_addr.as_ref()
+    }
+
+    pub unsafe fn fill_target_from_tls_sni(&mut self, default_port: u16) {
+        if self.target_addr.is_some() {
+            return;
+        }
+
+        if let Some(ptr) = self.client_tls {
+            let tls_stream = &*ptr;
+            let (_, server_conn) = tls_stream.get_ref();
+
+            if let Some(host) = server_conn.server_name() {
+                self.target_addr = Some(TargetAddr {
+                    host: host.to_string(),
+                    port: default_port,
+                });
+            }
+        }
     }
 }
 

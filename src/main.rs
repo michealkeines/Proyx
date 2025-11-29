@@ -1,19 +1,5 @@
-mod connection;
-mod controller;
-mod fsm;
-mod intercept;
-mod listener;
-mod scheduling;
-mod states;
+use Proyx::run_main_listener_safe;
 use tokio::task::LocalSet;
-mod CA;
-mod handlers;
-
-use crate::listener::run_main_listener;
-
-pub async fn run_main_listener_safe(addr: &str) -> std::io::Result<()> {
-    unsafe { run_main_listener(addr).await }
-}
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() {

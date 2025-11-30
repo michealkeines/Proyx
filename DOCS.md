@@ -22,6 +22,14 @@ Inspired by Ngnix event loop and Connection state that is chained together, writ
 
 Shared helper functions (`read_client_data`, `write_client_data`, etc.) simplify the byte-pumping logic across all handlers, and the upstream handler now always consults the cached target stored on `Connection` instead of hard-coded destinations.
 
+### Tunable parameters
+
+`src/config.rs` centralizes operational defaults:
+- Buffers: per-connection I/O slabs and H1 header/body caps (default 64 KiB for I/O + headers, 64 KiB max buffered body).
+- Upstream pooling: per-connection pool limit (default 8; evicts oldest on overflow).
+- H2 frame size: default 16,384 bytes per RFC 9113 §6.5.2.
+Changing these values adjusts memory/FD use and pooling behavior without code changes; RFC semantics remain enforced (e.g., H2 frame size guard, H1 host/version checks).
+
 ## HTTP/1.x flow (end-to-end)
 
 1. **Detect → TLS (optional)**: If the first bytes are TLS, we MITM the handshake, generate a cert for the SNI, and cache the server name as a fallback target. Plaintext H1 is handled similarly but without the TLS step.

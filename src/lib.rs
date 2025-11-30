@@ -1,4 +1,5 @@
 pub mod CA;
+pub mod config;
 pub mod connection;
 pub mod controller;
 pub mod fsm;

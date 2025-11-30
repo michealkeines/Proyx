@@ -83,4 +83,8 @@ pub unsafe fn schedule_next(conn: ConnPtr, step: NextStep) {
     }
 }
 
-pub fn cleanup_connection(conn: ConnPtr) {}
+pub fn cleanup_connection(conn: ConnPtr) {
+    unsafe {
+        drop(Box::from_raw(conn));
+    }
+}

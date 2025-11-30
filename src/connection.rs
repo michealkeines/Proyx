@@ -1,5 +1,6 @@
-use std::{net::SocketAddr, ptr::NonNull};
+use std::{alloc::Layout, net::SocketAddr, ptr::NonNull};
 
+use crate::config::CONFIG;
 use crate::controller::ControllerMsg;
 use crate::fsm::NextStep;
 use crate::handlers::*;
@@ -171,8 +172,8 @@ impl Connection {
         upstream_quic_addr: Option<SocketAddr>,
     ) -> Self {
         // allocate SIMD-aligned buffers
-        let in_cap = 64 * 1024;
-        let out_cap = 64 * 1024;
+        let in_cap = CONFIG.buffers.io_cap;
+        let out_cap = CONFIG.buffers.io_cap;
 
         let in_buf = {
             let raw =
@@ -249,19 +250,59 @@ pub struct PooledUpstream {
     pub tls: Option<*mut ClientTlsStream<TcpStream>>,
 }
 
+unsafe fn drop_tcp(ptr: Option<*mut TcpStream>) {
+    if let Some(p) = ptr {
+        drop(Box::from_raw(p));
+    }
+}
+
+unsafe fn drop_client_tls(ptr: Option<*mut ClientTlsStream<TcpStream>>) {
+    if let Some(p) = ptr {
+        drop(Box::from_raw(p));
+    }
+}
+
+unsafe fn drop_server_tls(ptr: Option<*mut ServerTlsStream<TcpStream>>) {
+    if let Some(p) = ptr {
+        drop(Box::from_raw(p));
+    }
+}
+
+unsafe fn drop_pooled_upstream(entry: PooledUpstream) {
+    drop_client_tls(entry.tls);
+    drop_tcp(entry.tcp);
+}
+
 impl Connection {
     pub fn take_pooled_upstream(&mut self, target: &TargetAddr, tls_required: bool) -> bool {
-        if let Some(idx) = self.upstream_pool.iter().position(|p| p.target.host == target.host && p.target.port == target.port) {
-            let entry = self.upstream_pool.remove(idx);
+        if let Some(idx) = self
+            .upstream_pool
+            .iter()
+            .position(|p| p.target.host == target.host && p.target.port == target.port)
+        {
+            let mut entry = self.upstream_pool.remove(idx);
+            let mut reused = false;
+
             if tls_required {
-                if let Some(tls) = entry.tls {
+                if let Some(tls) = entry.tls.take() {
                     self.upstream_tls = Some(tls);
-                    return true;
+                    reused = true;
                 }
-            } else if let Some(tcp) = entry.tcp {
+            } else if let Some(tcp) = entry.tcp.take() {
                 self.upstream_tcp = Some(tcp);
-                return true;
+                reused = true;
             }
+
+            unsafe {
+                if let Some(tls) = entry.tls.take() {
+                    drop_client_tls(Some(tls));
+                }
+                if let Some(tcp) = entry.tcp.take() {
+                    drop_tcp(Some(tcp));
+                }
+            }
+
+            return reused;
         }
         false
     }
@@ -275,8 +316,24 @@ impl Connection {
             return;
         }
 
+        let target = self.target_addr.as_ref().unwrap().clone();
+
+        if let Some(idx) = self
+            .upstream_pool
+            .iter()
+            .position(|p| p.target.host == target.host && p.target.port == target.port)
+        {
+            let existing = self.upstream_pool.remove(idx);
+            unsafe { drop_pooled_upstream(existing) };
+        }
+
+        if self.upstream_pool.len() >= CONFIG.upstream.pool_limit {
+            let evicted = self.upstream_pool.remove(0);
+            unsafe { drop_pooled_upstream(evicted) };
+        }
+
         let entry = PooledUpstream {
-            target: self.target_addr.as_ref().unwrap().clone(),
+            target,
             tcp: self.upstream_tcp.take(),
             tls: self.upstream_tls.take(),
         };
@@ -309,6 +366,26 @@ impl Connection {
                     port: default_port,
                 });
             }
+        }
+    }
+}
+
+impl Drop for Connection {
+    fn drop(&mut self) {
+        unsafe {
+            drop_server_tls(self.client_tls.take());
+            drop_tcp(self.client_tcp.take());
+            drop_client_tls(self.upstream_tls.take());
+            drop_tcp(self.upstream_tcp.take());
+
+            for entry in self.upstream_pool.drain(..) {
+                drop_pooled_upstream(entry);
+            }
+
+            let in_layout = Layout::from_size_align(self.in_cap, 32).unwrap();
+            std::alloc::dealloc(self.in_buf.as_ptr(), in_layout);
+            let out_layout = Layout::from_size_align(self.out_cap, 32).unwrap();
+            std::alloc::dealloc(self.out_buf.as_ptr(), out_layout);
         }
     }
 }

@@ -2,6 +2,8 @@
 
 The proxy is driven by a single-threaded event loop that progresses each connection through a state machine. Every connection owns a `Connection` struct and yields control by returning a `NextStep` that either continues, waits for I/O, or closes the connection; different protocol handlers are chained only after the previous state completes.
 
+Inspired by Ngnix event loop and Connection state that is chained together, written on completly raw pointers based rust, it allows us to manage memory with any overhead and this should moto should stay the same in future updates too, it should be fully raw pointer based + chainned event driven state machine.
+
 ### Lifecycle overview
 
 1. **AcceptClientConnection** – listener spins up the `Connection`, caches buffers, and enters the transport handler.
@@ -28,7 +30,7 @@ Shared helper functions (`read_client_data`, `write_client_data`, etc.) simplify
 4. **Forwarding**:
    - **CONNECT**: send `HTTP/1.1 200 Connection Established\r\n\r\n` once, then tunnel bytes with `copy_bidirectional`.
    - **Regular requests**: forward the rebuilt request headers to upstream, then stream bodies with RFC 9112 framing: fixed `Content-Length` is counted down, `Transfer-Encoding: chunked` is parsed and forwarded chunk-by-chunk (including trailers), and `Expect: 100-continue` gating is honored. Responses are re-sanitized (hop-by-hop stripped, `Connection` normalized), and chunked/length-delimited bodies are forwarded with the same chunk parser.
-5. **Keep-alive & pooling**: if both request and response allow persistence, the connection enters `CheckKeepAlive` → `PrepareNextRequest`, resets per-request state, and waits for the next request on the same client socket. The current upstream socket is moved into an on-connection pool keyed by host:port; subsequent requests reuse a matching pooled upstream (TLS or TCP) and skip DNS/TCP/TLS handshakes when possible. Otherwise we close.
+5. **Keep-alive & pooling**: if both request and response allow persistence, the connection enters `CheckKeepAlive` → `PrepareNextRequest`, resets per-request state, and waits for the next request on the same client socket. The current upstream socket is moved into an on-connection pool keyed by host:port (capped at 8 entries, evicting the oldest if needed); subsequent requests reuse a matching pooled upstream (TLS or TCP) and skip DNS/TCP/TLS handshakes when possible. Otherwise we close and drop the transport.
 
 ## HTTP/2 flow (RFC 9113 aligned)
 

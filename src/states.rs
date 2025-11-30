@@ -1,8 +1,13 @@
+use std::alloc::Layout;
 use std::ptr::NonNull;
+
+use crate::config::CONFIG;
 
 pub struct H1Session {
     pub headers: NonNull<u8>,
+    pub headers_cap: usize,
     pub body: Option<NonNull<u8>>,
+    pub body_cap: usize,
     pub headers_count: Option<u64>,
     pub body_len: Option<u64>,
     pub parsed_headers: bool,
@@ -26,7 +31,7 @@ impl H1Session {
         if (len == 0) {
             return false;
         }
-        let k = (64 * 1024) as u64;
+        let k = CONFIG.buffers.h1_body_max as u64;
         if (len > k) {
             println!("BODY SIZE is too big\n");
             return false;
@@ -38,11 +43,12 @@ impl H1Session {
             );
             Some(NonNull::new(raw).expect("failed alloc headers buf"))
         };
+        self.body_cap = len as usize;
 
         return true;
     }
     pub unsafe fn new() -> H1Session {
-        let in_cap = 64 * 1024;
+        let in_cap = CONFIG.buffers.h1_headers_cap;
         let headers = {
             let raw =
                 std::alloc::alloc_zeroed(std::alloc::Layout::from_size_align(in_cap, 32).unwrap());
@@ -50,7 +56,9 @@ impl H1Session {
         };
         Self {
             headers: headers,
+            headers_cap: in_cap,
             body: None,
+            body_cap: 0,
             headers_count: None,
             body_len: None,
             parsed_body: false,
@@ -63,6 +71,24 @@ impl H1Session {
             is_head: false,
             is_connect: false,
             version_1_0: false,
+        }
+    }
+}
+
+impl Drop for H1Session {
+    fn drop(&mut self) {
+        unsafe {
+            if self.headers_cap > 0 {
+                let layout = Layout::from_size_align(self.headers_cap, 32).unwrap();
+                std::alloc::dealloc(self.headers.as_ptr(), layout);
+            }
+
+            if let Some(body_ptr) = self.body.take() {
+                if self.body_cap > 0 {
+                    let layout = Layout::from_size_align(self.body_cap, 32).unwrap();
+                    std::alloc::dealloc(body_ptr.as_ptr(), layout);
+                }
+            }
         }
     }
 }

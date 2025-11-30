@@ -7,6 +7,7 @@ use hpack::Decoder;
 
 use crate::{
     connection::{Connection, ReadEnum, WriteEnum},
+    config::CONFIG,
     fsm::NextStep,
     states::*,
 };
@@ -27,7 +28,7 @@ use tokio_rustls::{
     },
 };
 
-const H2_DEFAULT_MAX_FRAME_SIZE: usize = 16_384;
+const H2_DEFAULT_MAX_FRAME_SIZE: usize = CONFIG.h2.max_frame_size;
 
 pub async unsafe fn transport_handler(conn: &mut Connection, s: TransportState) -> NextStep {
     println!("[TRANSPORT] {:?}", s);

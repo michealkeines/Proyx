@@ -10,6 +10,11 @@ pub struct H1Session {
     pub content_len: Option<u64>,
     pub is_chunked: bool,
     pub keep_alive: bool,
+    pub chunk_remaining: u64,
+    pub expect_continue: bool,
+    pub is_head: bool,
+    pub is_connect: bool,
+    pub version_1_0: bool,
 }
 
 impl H1Session {
@@ -53,6 +58,11 @@ impl H1Session {
             content_len: None,
             is_chunked: false,
             keep_alive: false,
+            chunk_remaining: 0,
+            expect_continue: false,
+            is_head: false,
+            is_connect: false,
+            version_1_0: false,
         }
     }
 }

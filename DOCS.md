@@ -20,6 +20,16 @@ The proxy is driven by a single-threaded event loop that progresses each connect
 
 Shared helper functions (`read_client_data`, `write_client_data`, etc.) simplify the byte-pumping logic across all handlers, and the upstream handler now always consults the cached target stored on `Connection` instead of hard-coded destinations.
 
+## HTTP/1.x flow (end-to-end)
+
+1. **Detect → TLS (optional)**: If the first bytes are TLS, we MITM the handshake, generate a cert for the SNI, and cache the server name as a fallback target. Plaintext H1 is handled similarly but without the TLS step.
+2. **Request headers**: `RecvHeaders` reads until `\r\n\r\n`, enforces HTTP/1.1 `Host` and version checks, strips hop-by-hop headers (`Connection`, `Proxy-Connection`, `Keep-Alive`, `TE`, `Transfer-Encoding`, `Upgrade`), rewrites absolute-form targets to origin-form, and rebuilds a clean header block with the right `Host`, `Connection` token, and either `Content-Length` or `Transfer-Encoding: chunked`. `Expect: 100-continue` is answered before proxying the body. CONNECT marks `upstream_tls_required=false` and prepares a tunnel; HTTPS and port 443 mark `upstream_tls_required=true`.
+3. **Upstream connect**: `Upstream::Dns -> TcpConnectBegin -> TlsHandshakeBegin` (TLS only if required). On success, control resumes at the pending H1 state recorded in `next_state_after_upstream`.
+4. **Forwarding**:
+   - **CONNECT**: send `HTTP/1.1 200 Connection Established\r\n\r\n` once, then tunnel bytes with `copy_bidirectional`.
+   - **Regular requests**: forward the rebuilt request headers to upstream, then stream bodies with RFC 9112 framing: fixed `Content-Length` is counted down, `Transfer-Encoding: chunked` is parsed and forwarded chunk-by-chunk (including trailers), and `Expect: 100-continue` gating is honored. Responses are re-sanitized (hop-by-hop stripped, `Connection` normalized), and chunked/length-delimited bodies are forwarded with the same chunk parser.
+5. **Close**: after the response body completes (or on any framing error) the connection closes; persistent keep-alive/pipelining are not yet enabled.
+
 ## HTTP/2 flow (RFC 9113 aligned)
 
 1. **Detect → TLS → ALPN**: TLS is MITMed; ALPN decides H2 vs H1. For H2 we clear any target derived from SNI so the request target is taken from pseudo-headers, not the SNI.

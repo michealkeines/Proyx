@@ -1,29 +1,32 @@
 use std::io::{Error, ErrorKind};
 use std::sync::Arc;
 
-use httparse::{Request, Response, Status};
+use httparse::{Request, Status};
 use rustls_pki_types::ServerName;
 use hpack::Decoder;
 
 use crate::{
     connection::{Connection, ReadEnum, WriteEnum},
     config::CONFIG,
+    controller::ControllerMsg,
     fsm::NextStep,
     states::*,
 };
 
 use tokio::{
-    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, copy_bidirectional},
+    io::{AsyncReadExt, AsyncWriteExt, copy_bidirectional},
     net::TcpStream,
 };
 
+use tokio::sync::mpsc::error::TryRecvError;
 use crate::CA::helpers::build_fake_cert_for_domain;
 use tokio_rustls::{
     TlsAcceptor, TlsConnector,
-    client::TlsStream,
+    client::TlsStream as ClientTlsStream,
+    server::TlsStream as ServerTlsStream,
     rustls::{
         ClientConfig, RootCertStore, ServerConfig, client,
-        pki_types::{CertificateDer, PrivateKeyDer, TrustAnchor, pem::PemObject},
+        pki_types::{CertificateDer},
         server,
     },
 };
@@ -155,6 +158,12 @@ pub async unsafe fn tls_handler(conn: &mut Connection, s: TlsState) -> NextStep 
         // -----------------------------------------------------------
         TlsState::Handshake(TlsHandshakeState::HandshakeBegin) => {
             println!("[TLS] HandshakeBegin → MITM certificate generation");
+            println!(
+                "[TLS] HandshakeBegin sockets: tcp_present={} tls_present={} mitm_present={}",
+                conn.client_tcp.is_some(),
+                conn.client_tls.is_some(),
+                conn.client_mitm_tls.is_some()
+            );
 
             // Drop any bytes that were only peeked during detection.
             conn.in_len = 0;
@@ -164,10 +173,11 @@ pub async unsafe fn tls_handler(conn: &mut Connection, s: TlsState) -> NextStep 
                 "TLS handshake begin requires client TCP stream"
             );
 
-            // --- Extract SNI from ClientHello ---
-            let client_hello = conn.in_buf.as_mut();
-            let sni = "localhost".to_string();
-
+            // Prefer an already-known target host (e.g., from CONNECT) when minting the leaf cert.
+            let sni = conn
+                .target()
+                .map(|t| t.host.clone())
+                .unwrap_or_else(|| "localhost".to_string());
             println!("[TLS] Extracted SNI = {}", sni);
 
             // --- Generate fake cert signed by CA ---
@@ -193,31 +203,50 @@ pub async unsafe fn tls_handler(conn: &mut Connection, s: TlsState) -> NextStep 
         // -----------------------------------------------------------
         TlsState::Handshake(TlsHandshakeState::HandshakeRead) => {
             println!("[TLS] Accepting TLS handshake");
-
-            debug_assert!(
+            println!(
+                "[TLS] HandshakeRead streams: tcp_present={} tls_present={} mitm_present={}",
                 conn.client_tcp.is_some(),
-                "TLS handshake read requires client TCP stream"
+                conn.client_tls.is_some(),
+                conn.client_mitm_tls.is_some()
             );
 
-            println!("[TLS] Accepting TLS handshake");
-
-            // 1. Recover ownership of TcpStream from raw pointer
-            let tcp_box: Box<TcpStream> = Box::from_raw(conn.client_tcp.unwrap() as *mut TcpStream);
-
-            // 2. Get acceptor reference
             let mut acceptor: &mut TlsAcceptor = &mut *(conn.scratch as *mut TlsAcceptor);
 
-            // 3. Move TcpStream into accept()  (NO &mut allowed)
-            match acceptor.accept(*tcp_box).await {
-                Ok(tls_stream) => {
-                    // 4. tls_stream is TlsStream<TcpStream>
+            if let Some(tcp_ptr) = conn.client_tcp.take() {
+                println!("[TLS] Handshake using raw client TCP");
+                let tcp_box: Box<TcpStream> = Box::from_raw(tcp_ptr);
+
+                match acceptor.accept(*tcp_box).await {
+                    Ok(tls_stream) => {
                     conn.client_tls = Some(Box::into_raw(Box::new(tls_stream)));
-                    conn.client_tcp = None; // no longer valid
                 }
                 Err(e) => {
                     println!("[TLS] Handshake error: {}", e);
                     return NextStep::Close;
                 }
+                }
+            } else if let Some(tls_ptr) = conn.client_tls.take() {
+                println!("[TLS] Handshake using existing client TLS (nested MITM inside CONNECT)");
+                let tls_box: Box<ServerTlsStream<TcpStream>> = Box::from_raw(tls_ptr);
+
+                match acceptor.accept(*tls_box).await {
+                    Ok(nested_tls) => {
+                        conn.client_mitm_tls = Some(Box::into_raw(Box::new(nested_tls)));
+                    }
+                    Err(e) => {
+                        println!("[TLS] Nested handshake error: {}", e);
+                        return NextStep::Close;
+                    }
+                }
+            } else {
+                if conn.client_mitm_tls.is_some() {
+                    println!("[TLS] HandshakeRead found existing MITM TLS, skipping accept");
+                    return NextStep::Continue(ProxyState::Tls(TlsState::Handshake(
+                        TlsHandshakeState::HandshakeComplete,
+                    )));
+                }
+                println!("[TLS] Missing client stream during handshake");
+                return NextStep::Close;
             }
 
             return NextStep::Continue(ProxyState::Tls(TlsState::Handshake(
@@ -232,7 +261,15 @@ pub async unsafe fn tls_handler(conn: &mut Connection, s: TlsState) -> NextStep 
             println!("[TLS] Client TLS Handshake Complete");
             conn.in_len = 0;
 
-            if let Some(ptr) = conn.client_tls {
+            if let Some(ptr) = conn.client_mitm_tls {
+                let tls_stream = &*ptr;
+                let (_, server_conn) = tls_stream.get_ref();
+                if let Some(proto) = server_conn.alpn_protocol() {
+                    conn.negotiated_alpn = Some(String::from_utf8_lossy(proto).to_string());
+                }
+                conn.readable = Some(ReadEnum::SeverTlsNested(ptr));
+                conn.writable = Some(WriteEnum::SeverTlsNested(ptr));
+            } else if let Some(ptr) = conn.client_tls {
                 let tls_stream = &*ptr;
                 let (_, server_conn) = tls_stream.get_ref();
                 if let Some(proto) = server_conn.alpn_protocol() {
@@ -367,22 +404,34 @@ pub async unsafe fn h1_handler(conn: &mut Connection, s: H1State) -> NextStep {
             };
 
             conn.set_target(target.0, target.1);
-            conn.upstream_tls_required = false;
             conn.connect_response_sent = false;
-            conn.next_state_after_upstream = Some(ProxyState::H1(H1State::Connect(
-                H1ConnectState::ConnectTunnelTransfer,
-            )));
 
-            if try_reuse_upstream(conn) {
-                if let Some(next) = conn.next_state_after_upstream.take() {
-                    println!("[H1] CONNECT reusing pooled upstream connection");
-                    return NextStep::Continue(next);
+            if CONFIG.connect.passthrough_tunnel {
+                println!("[H1] CONNECT mode=tunnel (passthrough)");
+                conn.upstream_tls_required = false;
+                conn.next_state_after_upstream = Some(ProxyState::H1(H1State::Connect(
+                    H1ConnectState::ConnectTunnelTransfer,
+                )));
+
+                if try_reuse_upstream(conn) {
+                    if let Some(next) = conn.next_state_after_upstream.take() {
+                        println!("[H1] CONNECT reusing pooled upstream connection");
+                        return NextStep::Continue(next);
+                    }
                 }
-            }
 
-            return NextStep::Continue(ProxyState::Upstream(UpstreamState::Dns(
-                UpstreamDnsState::ResolveStart,
-            )));
+                return NextStep::Continue(ProxyState::Upstream(UpstreamState::Dns(
+                    UpstreamDnsState::ResolveStart,
+                )));
+            } else {
+                println!("[H1] CONNECT mode=intercept (MITM)");
+                // Intercept mode: we will MITM inside the tunnel; do not pre-dial upstream yet.
+                conn.upstream_tls_required = true;
+                conn.next_state_after_upstream = None;
+                return NextStep::Continue(ProxyState::H1(H1State::Connect(
+                    H1ConnectState::ConnectTunnelTransfer,
+                )));
+            }
         }
 
         H1State::Connect(H1ConnectState::ConnectTunnelTransfer) => {
@@ -392,6 +441,29 @@ pub async unsafe fn h1_handler(conn: &mut Connection, s: H1State) -> NextStep {
                 conn.upstream_tls.is_some(),
                 conn.connect_response_sent
             );
+
+            // Intercept mode: MITM the tunnel instead of blind copy. No upstream required yet.
+            if !CONFIG.connect.passthrough_tunnel {
+                conn.upstream_tls_required = true;
+                if !conn.connect_response_sent {
+                    println!("[H1] CONNECT sending 200 response to client (intercept mode)");
+                    let _ = write_client_data(
+                        conn,
+                        b"HTTP/1.1 200 Connection Established\r\n\r\n",
+                    )
+                    .await;
+                    conn.connect_response_sent = true;
+                }
+
+                // Clear any buffered bytes before starting TLS handshake inside the tunnel.
+                conn.in_len = 0;
+                conn.next_state_after_upstream = None;
+
+                return NextStep::Continue(ProxyState::H1(H1State::Intercept(
+                    H1InterceptState::SendToController,
+                )));
+            }
+
             if conn.upstream_tcp.is_none() && conn.upstream_tls.is_none() {
                 println!("[H1] CONNECT tunnel waiting for upstream socket");
                 return NextStep::Continue(ProxyState::Upstream(UpstreamState::Dns(
@@ -417,6 +489,65 @@ pub async unsafe fn h1_handler(conn: &mut Connection, s: H1State) -> NextStep {
                 println!("[H1] CONNECT tunnel completed cleanly");
             }
             return NextStep::Close;
+        }
+
+        // -----------------------------------------------------------
+        // CONNECT intercept pipeline (optional)
+        // -----------------------------------------------------------
+        H1State::Intercept(H1InterceptState::SendToController) => {
+            if let Some(target) = conn.target() {
+                let _ = conn
+                    .controller_tx
+                    .send(ControllerMsg::Raw(format!("CONNECT {}:{}", target.host, target.port)));
+            } else {
+                let _ = conn
+                    .controller_tx
+                    .send(ControllerMsg::Raw("CONNECT (unknown target)".into()));
+            }
+
+            return NextStep::Continue(ProxyState::H1(H1State::Intercept(
+                H1InterceptState::WaitControllerDecision,
+            )));
+        }
+
+        H1State::Intercept(H1InterceptState::WaitControllerDecision) => {
+            match conn.controller_rx.try_recv() {
+                Ok(ControllerMsg::Block) => {
+                    let _ = write_client_data(conn, b"HTTP/1.1 403 Forbidden\r\n\r\n").await;
+                    return NextStep::Close;
+                }
+                Ok(ControllerMsg::Allow)
+                | Ok(ControllerMsg::Modify(_))
+                | Ok(ControllerMsg::Raw(_))
+                | Err(TryRecvError::Empty)
+                | Err(TryRecvError::Disconnected) => {
+                    // Default to allow so flows are not stalled if no controller is present.
+                    return NextStep::Continue(ProxyState::H1(H1State::Intercept(
+                        H1InterceptState::ApplyModification,
+                    )));
+                }
+            }
+        }
+
+        H1State::Intercept(H1InterceptState::ApplyModification) => {
+            // Ensure the 200 response was delivered (CONNECT must ack before tunneling).
+            if !conn.connect_response_sent {
+                let _ = write_client_data(
+                    conn,
+                    b"HTTP/1.1 200 Connection Established\r\n\r\n",
+                )
+                .await;
+                conn.connect_response_sent = true;
+            }
+
+            // Switch into TLS MITM to parse the inner HTTP request instead of blind tunneling.
+            conn.upstream_tls_required = true;
+            conn.next_state_after_upstream = None;
+            conn.in_len = 0;
+
+            return NextStep::Continue(ProxyState::Tls(TlsState::Handshake(
+                TlsHandshakeState::HandshakeBegin,
+            )));
         }
 
         // -----------------------------------------------------------
@@ -926,7 +1057,7 @@ pub async unsafe fn h1_handler(conn: &mut Connection, s: H1State) -> NextStep {
             let n = conn.out_len;
 
             debug_assert!(
-                conn.client_tls.is_some() || conn.client_tcp.is_some(),
+                conn.client_mitm_tls.is_some() || conn.client_tls.is_some() || conn.client_tcp.is_some(),
                 "[H1] SendResponseHeadersToClient needs a client stream"
             );
 
@@ -1602,7 +1733,9 @@ pub async unsafe fn h2_handler(conn: &mut Connection, s: H2State) -> NextStep {
                     conn.in_len = 0;
                 }
 
-                if let Some((method, host, port)) = parse_h2_pseudo_headers(&frag, 443) {
+                if let Some((method, host, port)) =
+                    parse_h2_pseudo_headers(&mut conn.h2_decoder, &frag, 443)
+                {
                     if method.eq_ignore_ascii_case("CONNECT") {
                         println!("[H2] CONNECT detected on stream {}", frame.stream_id);
                         conn.set_target(host, port);
@@ -1668,9 +1801,11 @@ pub async unsafe fn h2_handler(conn: &mut Connection, s: H2State) -> NextStep {
             }
 
             if frame.kind == 0x1 {
-                if let Some((method, host, port)) =
-                    parse_h2_pseudo_headers(&buf[9..9 + payload_len], 443)
-                {
+                if let Some((method, host, port)) = parse_h2_pseudo_headers(
+                    &mut conn.h2_decoder,
+                    &buf[9..9 + payload_len],
+                    443,
+                ) {
                     if method.eq_ignore_ascii_case("CONNECT") {
                         println!("[H2] CONNECT detected on stream {}", stream_id);
                         conn.set_target(host, port);
@@ -2216,10 +2351,12 @@ pub async unsafe fn h3_handler(conn: &mut Connection, s: H3State) -> NextStep {
 
 async unsafe fn read_client_data(conn: &mut Connection, buf: &mut [u8]) -> std::io::Result<usize> {
     debug_assert!(
-        conn.client_tls.is_some() || conn.client_tcp.is_some(),
+        conn.client_mitm_tls.is_some() || conn.client_tls.is_some() || conn.client_tcp.is_some(),
         "read_client_data: expected at least one client transport"
     );
-    if let Some(ptr) = conn.client_tls {
+    if let Some(ptr) = conn.client_mitm_tls {
+        (*ptr).read(buf).await
+    } else if let Some(ptr) = conn.client_tls {
         (*ptr).read(buf).await
     } else if let Some(ptr) = conn.client_tcp {
         (*ptr).read(buf).await
@@ -2230,10 +2367,12 @@ async unsafe fn read_client_data(conn: &mut Connection, buf: &mut [u8]) -> std::
 
 async unsafe fn write_client_data(conn: &mut Connection, data: &[u8]) -> std::io::Result<()> {
     debug_assert!(
-        conn.client_tls.is_some() || conn.client_tcp.is_some(),
+        conn.client_mitm_tls.is_some() || conn.client_tls.is_some() || conn.client_tcp.is_some(),
         "write_client_data: expected at least one client transport"
     );
-    if let Some(ptr) = conn.client_tls {
+    if let Some(ptr) = conn.client_mitm_tls {
+        (*ptr).write_all(data).await
+    } else if let Some(ptr) = conn.client_tls {
         (*ptr).write_all(data).await
     } else if let Some(ptr) = conn.client_tcp {
         (*ptr).write_all(data).await
@@ -2336,10 +2475,10 @@ fn parse_request_line(buf: &[u8]) -> Option<(String, String)> {
 }
 
 fn parse_h2_pseudo_headers(
+    decoder: &mut Decoder<'static>,
     payload: &[u8],
     default_port: u16,
 ) -> Option<(String, String, u16)> {
-    let mut decoder = Decoder::new();
     let headers = decoder.decode(payload).ok()?;
 
     let mut method: Option<String> = None;
@@ -2490,7 +2629,7 @@ fn prepare_h1_request(conn: &mut Connection, header_bytes: &[u8]) -> Result<(), 
         target_host = h;
         target_port = p;
         default_port = 443;
-        conn.upstream_tls_required = false;
+        conn.upstream_tls_required = !CONFIG.connect.passthrough_tunnel;
         conn.connect_response_sent = false;
         conn.next_state_after_upstream = Some(ProxyState::H1(H1State::Connect(
             H1ConnectState::ConnectTunnelTransfer,

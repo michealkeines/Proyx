@@ -11,12 +11,15 @@ use tokio::net::{UnixDatagram, UnixStream};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio_rustls::client::TlsStream as ClientTlsStream;
 use tokio_rustls::server::TlsStream as ServerTlsStream;
+type NestedServerTlsStream = ServerTlsStream<ServerTlsStream<TcpStream>>;
+use hpack::Decoder;
 
 #[derive(Debug, Clone, Copy)]
 pub enum ReadEnum {
     Tcp(*mut TcpStream),
     ClientTls(*mut ClientTlsStream<TcpStream>),
     SeverTls(*mut ServerTlsStream<TcpStream>),
+    SeverTlsNested(*mut NestedServerTlsStream),
     UnixStream(*mut UnixStream),
     UnixDatagram(*mut UnixDatagram),
     Udp(*mut UdpSocket),
@@ -28,6 +31,12 @@ impl ReadEnum {
             ReadEnum::Tcp(p) => (*p).as_mut().unwrap().readable().await,
             ReadEnum::ClientTls(p) => (*p).as_mut().unwrap().get_mut().0.readable().await,
             ReadEnum::SeverTls(p) => (*p).as_mut().unwrap().get_mut().0.readable().await,
+            ReadEnum::SeverTlsNested(p) => {
+                let outer = (*p).as_mut().unwrap();
+                let (inner_tls, _) = outer.get_mut();
+                let (tcp, _) = inner_tls.get_mut();
+                tcp.readable().await
+            }
             ReadEnum::UnixStream(p) => (*p).as_mut().unwrap().readable().await,
             ReadEnum::UnixDatagram(p) => (*p).as_mut().unwrap().readable().await,
             ReadEnum::Udp(p) => (*p).as_mut().unwrap().readable().await,
@@ -40,6 +49,7 @@ pub enum WriteEnum {
     Tcp(*mut TcpStream),
     ClientTls(*mut ClientTlsStream<TcpStream>),
     SeverTls(*mut ServerTlsStream<TcpStream>),
+    SeverTlsNested(*mut NestedServerTlsStream),
     UnixStream(*mut UnixStream),
     UnixDatagram(*mut UnixDatagram),
     Udp(*mut UdpSocket),
@@ -70,6 +80,13 @@ impl WriteEnum {
 
             WriteEnum::SeverTls(p) => (*p).as_mut().unwrap().get_mut().0.writable().await,
 
+            WriteEnum::SeverTlsNested(p) => {
+                let outer = (*p).as_mut().unwrap();
+                let (inner_tls, _) = outer.get_mut();
+                let (tcp, _) = inner_tls.get_mut();
+                tcp.writable().await
+            }
+
             WriteEnum::UnixStream(p) => (*p).as_mut().unwrap().writable().await,
 
             WriteEnum::UnixDatagram(p) => (*p).as_mut().unwrap().writable().await,
@@ -82,6 +99,8 @@ impl WriteEnum {
 pub struct Connection {
     pub client_tcp: Option<*mut TcpStream>,
     pub client_tls: Option<*mut ServerTlsStream<TcpStream>>,
+    /// Nested TLS stream when MITMing inside a CONNECT tunnel (TLS over TLS).
+    pub client_mitm_tls: Option<*mut NestedServerTlsStream>,
     /// Raw pointer to shared UDP socket (only for QUIC)
     pub client_udp: Option<*mut UdpSocket>,
 
@@ -123,6 +142,7 @@ pub struct Connection {
 
     pub scratch: u64,
     pub last_activity: std::time::Instant,
+    pub h2_decoder: Decoder<'static>,
 }
 
 impl Connection {
@@ -191,6 +211,7 @@ impl Connection {
             // client raw sockets
             client_tcp,
             client_tls: None,
+            client_mitm_tls: None,
             client_udp,
             client_quic_addr,
 
@@ -233,6 +254,7 @@ impl Connection {
             negotiated_alpn: None,
             last_activity: std::time::Instant::now(),
             upstream_pool: Vec::new(),
+            h2_decoder: Decoder::new(),
         }
     }
 
@@ -263,6 +285,12 @@ unsafe fn drop_client_tls(ptr: Option<*mut ClientTlsStream<TcpStream>>) {
 }
 
 unsafe fn drop_server_tls(ptr: Option<*mut ServerTlsStream<TcpStream>>) {
+    if let Some(p) = ptr {
+        drop(Box::from_raw(p));
+    }
+}
+
+unsafe fn drop_nested_server_tls(ptr: Option<*mut NestedServerTlsStream>) {
     if let Some(p) = ptr {
         drop(Box::from_raw(p));
     }
@@ -365,6 +393,19 @@ impl Connection {
                     host: host.to_string(),
                     port: default_port,
                 });
+                return;
+            }
+        }
+
+        if let Some(ptr) = self.client_mitm_tls {
+            let tls_stream = &*ptr;
+            let (_, server_conn) = tls_stream.get_ref();
+
+            if let Some(host) = server_conn.server_name() {
+                self.target_addr = Some(TargetAddr {
+                    host: host.to_string(),
+                    port: default_port,
+                });
             }
         }
     }
@@ -374,6 +415,7 @@ impl Drop for Connection {
     fn drop(&mut self) {
         unsafe {
             drop_server_tls(self.client_tls.take());
+            drop_nested_server_tls(self.client_mitm_tls.take());
             drop_tcp(self.client_tcp.take());
             drop_client_tls(self.upstream_tls.take());
             drop_tcp(self.upstream_tcp.take());

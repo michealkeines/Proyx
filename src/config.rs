@@ -19,10 +19,17 @@ pub struct H2Config {
     pub max_frame_size: usize,
 }
 
+pub struct ConnectConfig {
+    /// When true, CONNECT requests stay as raw tunnels (current behavior). When false,
+    /// we MITM and parse HTTP inside the tunnel.
+    pub passthrough_tunnel: bool,
+}
+
 pub struct Config {
     pub buffers: BufferConfig,
     pub upstream: UpstreamConfig,
     pub h2: H2Config,
+    pub connect: ConnectConfig,
 }
 
 impl Config {
@@ -36,6 +43,9 @@ impl Config {
             upstream: UpstreamConfig { pool_limit: 32 },
             h2: H2Config {
                 max_frame_size: 16_384,
+            },
+            connect: ConnectConfig {
+                passthrough_tunnel: false,
             },
         }
     }

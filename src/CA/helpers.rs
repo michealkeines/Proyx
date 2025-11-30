@@ -4,7 +4,7 @@ use openssl::{
     ec::{EcGroup, EcKey},
     hash::MessageDigest,
     nid::Nid,
-    pkey::{PKey, Private},
+    pkey::PKey,
     x509::{X509, X509Builder, X509Extension, X509NameBuilder},
 };
 use rustls_pki_types::{CertificateDer, PrivateKeyDer};

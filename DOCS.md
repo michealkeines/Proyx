@@ -4,6 +4,36 @@ The proxy is driven by a single-threaded event loop that progresses each connect
 
 Inspired by Ngnix event loop and Connection state that is chained together, written on completly raw pointers based rust, it allows us to manage memory with any overhead and this should moto should stay the same in future updates too, it should be fully raw pointer based + chainned event driven state machine.
 
+every byte in both directions passes through the proxy, so the proxy can read/modify/log before forwarding.
+
+Downstream (client → proxy → upstream): client talks to proxy; proxy reads the request (after TLS MITM if enabled), makes a decision, then forwards to upstream (plain or TLS as needed).
+Upstream (upstream → proxy → client): upstream’s response comes back to the proxy; proxy can inspect/modify, then sends to the client (over the client-facing transport/TLS).
+CONNECT specifics: if you tunnel, the proxy just shuttles opaque bytes; if you MITM, the proxy terminates the inner TLS so it can parse/alter the target HTTP before sending a separate TLS request to upstream.
+
+Client                    Proxy                          Upstream
+  | 1) TLS handshake w/ proxy (outer TLS)                  |
+  |------------------------------------------------------->|
+  | <------------------- proxy cert (for proxy host) ------|
+  |                                                        |
+  | 2) CONNECT www.target:443                              |
+  |------------------------------------------------------->|
+  | <------------------ 200 Connection Established --------|
+  |                                                        |
+  | 3) TLS handshake (inner) to target hostname            |
+  |   (proxy presents forged cert for target)              |
+  |------------------------------------------------------->|
+  | <------------------- forged target cert ----------------|
+  |                                                        |
+  | 4) HTTP over inner TLS (plaintext at proxy)            |
+  |------------------------------------------------------->|
+  |                                                        | 5) TLS handshake (proxy as client)
+  |                                                        |------------------------------->
+  |                                                        |<------ real server cert -------|
+  |                                                        |
+  | 6) Proxy forwards/modifies requests/responses between inner TLS and upstream TLS
+  |<------------------------------------------------------>|
+
+
 ### Lifecycle overview
 
 1. **AcceptClientConnection** – listener spins up the `Connection`, caches buffers, and enters the transport handler.
@@ -28,6 +58,7 @@ Shared helper functions (`read_client_data`, `write_client_data`, etc.) simplify
 - Buffers: per-connection I/O slabs and H1 header/body caps (default 64 KiB for I/O + headers, 64 KiB max buffered body).
 - Upstream pooling: per-connection pool limit (default 8; evicts oldest on overflow).
 - H2 frame size: default 16,384 bytes per RFC 9113 §6.5.2.
+- CONNECT handling: `connect.passthrough_tunnel=true` keeps the raw bidirectional tunnel (default). Set to `false` to MITM the CONNECT tunnel and parse HTTP inside it.
 Changing these values adjusts memory/FD use and pooling behavior without code changes; RFC semantics remain enforced (e.g., H2 frame size guard, H1 host/version checks).
 
 ## HTTP/1.x flow (end-to-end)

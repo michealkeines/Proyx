@@ -28,7 +28,7 @@ Shared helper functions (`read_client_data`, `write_client_data`, etc.) simplify
 4. **Forwarding**:
    - **CONNECT**: send `HTTP/1.1 200 Connection Established\r\n\r\n` once, then tunnel bytes with `copy_bidirectional`.
    - **Regular requests**: forward the rebuilt request headers to upstream, then stream bodies with RFC 9112 framing: fixed `Content-Length` is counted down, `Transfer-Encoding: chunked` is parsed and forwarded chunk-by-chunk (including trailers), and `Expect: 100-continue` gating is honored. Responses are re-sanitized (hop-by-hop stripped, `Connection` normalized), and chunked/length-delimited bodies are forwarded with the same chunk parser.
-5. **Close**: after the response body completes (or on any framing error) the connection closes; persistent keep-alive/pipelining are not yet enabled.
+5. **Keep-alive & pooling**: if both request and response allow persistence, the connection enters `CheckKeepAlive` → `PrepareNextRequest`, resets per-request state, and waits for the next request on the same client socket. The current upstream socket is moved into an on-connection pool keyed by host:port; subsequent requests reuse a matching pooled upstream (TLS or TCP) and skip DNS/TCP/TLS handshakes when possible. Otherwise we close.
 
 ## HTTP/2 flow (RFC 9113 aligned)
 

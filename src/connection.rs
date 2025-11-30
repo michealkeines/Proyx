@@ -107,6 +107,7 @@ pub struct Connection {
     pub connect_response_sent: bool,
     pub h2_connect_stream_id: Option<u32>,
     pub negotiated_alpn: Option<String>,
+    pub upstream_pool: Vec<PooledUpstream>,
 
     pub in_buf: NonNull<u8>,
     pub in_cap: usize,
@@ -230,6 +231,7 @@ impl Connection {
             h2_connect_stream_id: None,
             negotiated_alpn: None,
             last_activity: std::time::Instant::now(),
+            upstream_pool: Vec::new(),
         }
     }
 
@@ -237,6 +239,49 @@ impl Connection {
         let len = pkt.len().min(self.in_cap);
         std::ptr::copy_nonoverlapping(pkt.as_ptr(), self.in_buf.as_ptr(), len);
         self.in_len = len;
+    }
+}
+
+#[derive(Debug)]
+pub struct PooledUpstream {
+    pub target: TargetAddr,
+    pub tcp: Option<*mut TcpStream>,
+    pub tls: Option<*mut ClientTlsStream<TcpStream>>,
+}
+
+impl Connection {
+    pub fn take_pooled_upstream(&mut self, target: &TargetAddr, tls_required: bool) -> bool {
+        if let Some(idx) = self.upstream_pool.iter().position(|p| p.target.host == target.host && p.target.port == target.port) {
+            let entry = self.upstream_pool.remove(idx);
+            if tls_required {
+                if let Some(tls) = entry.tls {
+                    self.upstream_tls = Some(tls);
+                    return true;
+                }
+            } else if let Some(tcp) = entry.tcp {
+                self.upstream_tcp = Some(tcp);
+                return true;
+            }
+        }
+        false
+    }
+
+    pub fn store_current_upstream_in_pool(&mut self) {
+        if self.target_addr.is_none() {
+            return;
+        }
+
+        if self.upstream_tls.is_none() && self.upstream_tcp.is_none() {
+            return;
+        }
+
+        let entry = PooledUpstream {
+            target: self.target_addr.as_ref().unwrap().clone(),
+            tcp: self.upstream_tcp.take(),
+            tls: self.upstream_tls.take(),
+        };
+
+        self.upstream_pool.push(entry);
     }
 }
 

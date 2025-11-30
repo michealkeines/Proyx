@@ -372,6 +372,13 @@ pub async unsafe fn h1_handler(conn: &mut Connection, s: H1State) -> NextStep {
                 H1ConnectState::ConnectTunnelTransfer,
             )));
 
+            if try_reuse_upstream(conn) {
+                if let Some(next) = conn.next_state_after_upstream.take() {
+                    println!("[H1] CONNECT reusing pooled upstream connection");
+                    return NextStep::Continue(next);
+                }
+            }
+
             return NextStep::Continue(ProxyState::Upstream(UpstreamState::Dns(
                 UpstreamDnsState::ResolveStart,
             )));
@@ -448,6 +455,13 @@ pub async unsafe fn h1_handler(conn: &mut Connection, s: H1State) -> NextStep {
                         )));
                     }
 
+                    if try_reuse_upstream(conn) {
+                        if let Some(next) = conn.next_state_after_upstream.take() {
+                            println!("[H1] Reusing pooled upstream connection");
+                            return NextStep::Continue(next);
+                        }
+                    }
+
                     return NextStep::Continue(ProxyState::Upstream(UpstreamState::Dns(
                         UpstreamDnsState::ResolveStart,
                     )));
@@ -476,6 +490,12 @@ pub async unsafe fn h1_handler(conn: &mut Connection, s: H1State) -> NextStep {
             if let Err(e) = write_client_data(conn, b"HTTP/1.1 100 Continue\r\n\r\n").await {
                 println!("[H1] Failed to send 100-continue: {}", e);
                 return NextStep::Close;
+            }
+            if try_reuse_upstream(conn) {
+                if let Some(next) = conn.next_state_after_upstream.take() {
+                    println!("[H1] Reusing pooled upstream connection after 100-continue");
+                    return NextStep::Continue(next);
+                }
             }
             return NextStep::Continue(ProxyState::Upstream(UpstreamState::Dns(
                 UpstreamDnsState::ResolveStart,
@@ -823,11 +843,11 @@ pub async unsafe fn h1_handler(conn: &mut Connection, s: H1State) -> NextStep {
                         conn.in_len = 0;
                     }
 
-                    if from_upstream {
-                        return NextStep::Continue(ProxyState::H1(H1State::Lifecycle(
-                            H1ConnLifecycleState::CloseConnection,
-                        )));
-                    }
+                if from_upstream {
+                    return NextStep::Continue(ProxyState::H1(H1State::Lifecycle(
+                        H1ConnLifecycleState::CheckKeepAlive,
+                    )));
+                }
 
                     return NextStep::Continue(ProxyState::H1(H1State::Forward(
                         H1ForwardState::UpstreamRecvHeaders,
@@ -931,7 +951,7 @@ pub async unsafe fn h1_handler(conn: &mut Connection, s: H1State) -> NextStep {
             }
 
             return NextStep::Continue(ProxyState::H1(H1State::Lifecycle(
-                H1ConnLifecycleState::CloseConnection,
+                H1ConnLifecycleState::CheckKeepAlive,
             )));
         }
 
@@ -945,7 +965,7 @@ pub async unsafe fn h1_handler(conn: &mut Connection, s: H1State) -> NextStep {
 
             if remaining == 0 {
                 return NextStep::Continue(ProxyState::H1(H1State::Lifecycle(
-                    H1ConnLifecycleState::CloseConnection,
+                    H1ConnLifecycleState::CheckKeepAlive,
                 )));
             }
 
@@ -1030,6 +1050,46 @@ pub async unsafe fn h1_handler(conn: &mut Connection, s: H1State) -> NextStep {
             return NextStep::Close;
         }
 
+        H1State::Lifecycle(H1ConnLifecycleState::CheckKeepAlive) => {
+            let req_keep = conn.client_h1_state.keep_alive;
+            let resp_keep = conn.upstream_h1_state.keep_alive;
+
+            if !req_keep || !resp_keep {
+                println!(
+                    "[H1] keep-alive not allowed (req_keep={} resp_keep={}), closing",
+                    req_keep, resp_keep
+                );
+                return NextStep::Continue(ProxyState::H1(H1State::Lifecycle(
+                    H1ConnLifecycleState::CloseConnection,
+                )));
+            }
+
+            println!("[H1] keep-alive allowed, preparing next request");
+            conn.store_current_upstream_in_pool();
+
+            return NextStep::Continue(ProxyState::H1(H1State::Lifecycle(
+                H1ConnLifecycleState::PrepareNextRequest,
+            )));
+        }
+
+        H1State::Lifecycle(H1ConnLifecycleState::PrepareNextRequest) => {
+            println!("[H1] Resetting state for next request on keep-alive");
+            reset_h1_session(&mut conn.client_h1_state);
+            reset_h1_session(&mut conn.upstream_h1_state);
+            conn.in_len = 0;
+            conn.out_len = 0;
+            conn.next_state_after_upstream = None;
+            conn.target_addr = None;
+            conn.upstream_tls_required = true;
+            conn.connect_response_sent = false;
+            conn.h2_connect_stream_id = None;
+            conn.scratch = 0;
+
+            return NextStep::WaitRead(ProxyState::H1(H1State::Request(
+                H1RequestParseState::RecvHeaders,
+            )));
+        }
+
         _ => {
             println!("[H1] Unhandled state");
             NextStep::Close
@@ -1047,6 +1107,14 @@ pub async unsafe fn upstream_handler(conn: &mut Connection, s: UpstreamState) ->
     match s {
         // ----------------------------------------------------------
         UpstreamState::Dns(UpstreamDnsState::ResolveStart) => {
+            if conn.upstream_tcp.is_some() || conn.upstream_tls.is_some() {
+                println!("[UPSTREAM] Reusing existing upstream transport from pool");
+                if let Some(next) = conn.next_state_after_upstream.take() {
+                    return NextStep::Continue(next);
+                }
+                return NextStep::Close;
+            }
+
             println!("[UPSTREAM] Dummy DNS resolution");
             conn.scratch = 443;
             return NextStep::Continue(ProxyState::Upstream(UpstreamState::Tcp(
@@ -2864,6 +2932,29 @@ async unsafe fn h2_connect_forward_upstream(
     NextStep::Continue(ProxyState::H2(H2State::Proxy(
         H2ProxyState::ProxyFramesClientToUpstream,
     )))
+}
+
+fn reset_h1_session(sess: &mut H1Session) {
+    sess.headers_count = None;
+    sess.body_len = None;
+    sess.parsed_headers = false;
+    sess.parsed_body = false;
+    sess.content_len = None;
+    sess.is_chunked = false;
+    sess.keep_alive = false;
+    sess.chunk_remaining = 0;
+    sess.expect_continue = false;
+    sess.is_head = false;
+    sess.is_connect = false;
+    sess.version_1_0 = false;
+}
+
+fn try_reuse_upstream(conn: &mut Connection) -> bool {
+    let target = conn.target().cloned();
+    let needed_tls = conn.upstream_tls_required;
+    target
+        .map(|t| conn.take_pooled_upstream(&t, needed_tls))
+        .unwrap_or(false)
 }
 
 pub async unsafe fn intercept_handler(_: &mut Connection, _: InterceptState) -> NextStep {

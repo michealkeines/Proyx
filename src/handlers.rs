@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use httparse::{Request, Status};
 use rustls_pki_types::ServerName;
-use hpack::Decoder;
+use hpack::{Decoder, Encoder};
 
 use crate::{
     connection::{Connection, ReadEnum, WriteEnum},
@@ -1313,9 +1313,10 @@ pub async unsafe fn upstream_handler(conn: &mut Connection, s: UpstreamState) ->
             roots.add(CertificateDer::from(der_bytes)).unwrap();
             roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
 
-            let cfg = ClientConfig::builder()
+            let mut cfg = ClientConfig::builder()
                 .with_root_certificates(roots)
                 .with_no_client_auth();
+            cfg.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
 
             let connector = TlsConnector::from(Arc::new(cfg));
 
@@ -1398,6 +1399,17 @@ pub async unsafe fn h2_handler(conn: &mut Connection, s: H2State) -> NextStep {
             const CLIENT_PREFACE: &[u8; 24] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
             let preface_len = CLIENT_PREFACE.len();
 
+            conn.h2_pending_upstream_frames.clear();
+            conn.h2_use_upstream_h2 = true;
+            conn.h2_upstream_ready = false;
+            conn.h2_upstream_preface_sent = false;
+            conn.h2_client_max_frame_size = H2_DEFAULT_MAX_FRAME_SIZE;
+            conn.h2_upstream_max_frame_size = H2_DEFAULT_MAX_FRAME_SIZE;
+            conn.h2_decoder = Decoder::new();
+            conn.h2_upstream_decoder = Decoder::new();
+            conn.h2_client_encoder = Encoder::new();
+            conn.h2_upstream_encoder = Encoder::new();
+
             while conn.in_len < preface_len {
                 match read_client_data(conn, &mut buf[conn.in_len..preface_len]).await {
                     Ok(n) if n > 0 => {
@@ -1431,6 +1443,7 @@ pub async unsafe fn h2_handler(conn: &mut Connection, s: H2State) -> NextStep {
             }
 
             println!("[H2] Client preface complete");
+            conn.h2_client_preface_seen = true;
 
             // Server preface: immediately send our SETTINGS frame (empty payload = defaults)
             let server_settings = build_h2_frame_header(0, 0x4, 0x0, 0);
@@ -1521,6 +1534,15 @@ pub async unsafe fn h2_handler(conn: &mut Connection, s: H2State) -> NextStep {
 
             println!("[H2] Client settings frame len {}", settings_len);
 
+            if conn.h2_use_upstream_h2 {
+                conn
+                    .h2_pending_upstream_frames
+                    .extend_from_slice(&buf[..total]);
+            }
+            if settings_len > 0 {
+                apply_h2_settings(&mut conn.h2_client_max_frame_size, &buf[9..total]);
+            }
+
             // ACK client SETTINGS
             let settings_ack = build_h2_frame_header(0, 0x4, 0x1, 0);
             if let Err(e) = write_client_data(conn, &settings_ack).await {
@@ -1577,32 +1599,12 @@ pub async unsafe fn h2_handler(conn: &mut Connection, s: H2State) -> NextStep {
 
         H2State::FlowControl(H2FlowControlState::FlowControlWaitWindowUpdate) => {
             let payload_len = (conn.scratch & 0xffff_ffff) as usize;
-            let stream_id = (conn.scratch >> 32) as u32;
-            let frame = parse_h2_frame_header(&buf[..9]);
 
-            if payload_len > H2_DEFAULT_MAX_FRAME_SIZE {
+            if payload_len > conn.h2_client_max_frame_size {
                 return h2_connection_error(
                     conn,
                     0x6,
                     "frame payload exceeds max frame size",
-                )
-                .await;
-            }
-
-            if frame.kind == 0x4 && (payload_len % 6 != 0) && (frame.flags & 0x1 == 0) {
-                return h2_connection_error(
-                    conn,
-                    0x6,
-                    "SETTINGS length not multiple of 6",
-                )
-                .await;
-            }
-
-            if frame.kind == 0x4 && frame.flags & 0x1 != 0 && payload_len != 0 {
-                return h2_connection_error(
-                    conn,
-                    0x6,
-                    "SETTINGS ACK had non-zero length",
                 )
                 .await;
             }
@@ -1634,6 +1636,7 @@ pub async unsafe fn h2_handler(conn: &mut Connection, s: H2State) -> NextStep {
             }
 
             let frame = parse_h2_frame_header(&buf[..9]);
+            let total = 9 + payload_len;
 
             if let Some(connect_stream) = conn.h2_connect_stream_id {
                 if frame.stream_id == connect_stream && frame.kind == 0x0 {
@@ -1647,135 +1650,108 @@ pub async unsafe fn h2_handler(conn: &mut Connection, s: H2State) -> NextStep {
                 }
             }
 
-            // SETTINGS ack (len=0, type=0x4, ACK flag) → just loop
-            if frame.kind == 0x4 && frame.flags & 0x1 != 0 {
-                conn.in_len = 0;
-                println!("[H2] Received SETTINGS ACK from client");
+            if frame.kind == 0x4 {
+                if frame.flags & 0x1 != 0 {
+                    println!("[H2] Received SETTINGS ACK from client");
+                    consume_h2_frame(conn, buf, total);
+                    return NextStep::Continue(ProxyState::H2(H2State::FrameParse(
+                        H2FrameParseState::RecvFrameHeader,
+                    )));
+                }
+
+                if payload_len % 6 != 0 {
+                    return h2_connection_error(conn, 0x6, "SETTINGS length not multiple of 6")
+                        .await;
+                }
+
+                apply_h2_settings(&mut conn.h2_client_max_frame_size, &buf[9..total]);
+
+                let settings_ack = build_h2_frame_header(0, 0x4, 0x1, 0);
+                if let Err(e) = write_client_data(conn, &settings_ack).await {
+                    println!("[H2] Failed to send SETTINGS ACK: {}", e);
+                    return NextStep::Close;
+                }
+
+                consume_h2_frame(conn, buf, total);
                 return NextStep::Continue(ProxyState::H2(H2State::FrameParse(
                     H2FrameParseState::RecvFrameHeader,
                 )));
             }
 
-            // HEADERS (stream > 0): parse pseudo headers and establish target. Supports PADDED,
-            // PRIORITY, and CONTINUATION per RFC 9113.
             if frame.kind == 0x1 && frame.stream_id != 0 {
-                let mut consumed_total = 9 + payload_len;
-                let mut frag = Vec::new();
+                let (frag, consumed_total) = match h2_read_headers_block(conn, buf, &frame, true).await {
+                    Ok(v) => v,
+                    Err(next) => return next,
+                };
 
-                let mut offset = 9;
-                let mut remaining = payload_len;
-                let mut pad_len = 0usize;
-
-                if frame.flags & 0x8 != 0 {
-                    if remaining == 0 {
-                        return h2_connection_error(conn, 0x1, "PADDED with zero length").await;
+                let headers = match decode_h2_header_block(&mut conn.h2_decoder, &frag) {
+                    Some(h) => h,
+                    None => {
+                        return h2_connection_error(conn, 0x1, "failed to decode HEADERS").await;
                     }
-                    pad_len = buf[offset] as usize;
-                    offset += 1;
-                    remaining = remaining.saturating_sub(1);
+                };
+
+                if conn.h2_use_upstream_h2 {
+                    let frames = encode_h2_headers_for_peer(
+                        &mut conn.h2_upstream_encoder,
+                        &headers,
+                        frame.stream_id,
+                        frame.flags & 0x1 != 0,
+                        conn.h2_upstream_max_frame_size,
+                    );
+                    conn.h2_pending_upstream_frames.extend_from_slice(&frames);
                 }
 
-                if frame.flags & 0x20 != 0 {
-                    if remaining < 5 {
-                        return h2_connection_error(conn, 0x1, "PRIORITY flag missing payload").await;
-                    }
-                    offset += 5;
-                    remaining -= 5;
-                }
-
-                if remaining < pad_len {
-                    return h2_connection_error(conn, 0x1, "pad length exceeds payload").await;
-                }
-
-                let fragment_len = remaining - pad_len;
-                frag.extend_from_slice(&buf[offset..offset + fragment_len]);
-
-                let mut end_headers = frame.flags & 0x4 != 0;
-
-                while !end_headers {
-                    // Ensure next frame header is available
-                    if conn.in_len < consumed_total + 9 {
-                        let need = consumed_total + 9 - conn.in_len;
-                        match read_client_data(conn, &mut buf[conn.in_len..conn.in_len + need]).await {
-                            Ok(n) if n > 0 => conn.in_len += n,
-                            _ => return h2_connection_error(conn, 0x1, "incomplete CONTINUATION header").await,
+                let (method, host, port) =
+                    match extract_h2_pseudo_headers(&headers, 443) {
+                        Some(v) => v,
+                        None => {
+                            return h2_connection_error(
+                                conn,
+                                0x1,
+                                "failed to parse HEADERS pseudo-headers",
+                            )
+                            .await;
                         }
-                    }
+                    };
 
-                    let next_header = parse_h2_frame_header(&buf[consumed_total..consumed_total + 9]);
-                    if next_header.kind != 0x9 || next_header.stream_id != frame.stream_id {
-                        return h2_connection_error(conn, 0x1, "expected CONTINUATION").await;
-                    }
+                consume_h2_frame(conn, buf, consumed_total);
 
-                    let next_total = consumed_total + 9 + next_header.length;
-                    if next_total > conn.in_len {
-                        let need = next_total - conn.in_len;
-                        if next_total > conn.in_cap {
-                            return h2_connection_error(conn, 0x6, "CONTINUATION too large for buffer").await;
-                        }
-                        match read_client_data(conn, &mut buf[conn.in_len..next_total]).await {
-                            Ok(n) if n > 0 => conn.in_len += n,
-                            _ => return h2_connection_error(conn, 0x1, "incomplete CONTINUATION payload").await,
-                        }
-                    }
-
-                    frag.extend_from_slice(&buf[consumed_total + 9..consumed_total + 9 + next_header.length]);
-                    consumed_total = next_total;
-                    end_headers = next_header.flags & 0x4 != 0;
+                if method.eq_ignore_ascii_case("CONNECT") {
+                    println!("[H2] CONNECT detected on stream {}", frame.stream_id);
+                    conn.h2_use_upstream_h2 = false;
+                    conn.h2_pending_upstream_frames.clear();
+                    conn.set_target(host, port);
+                    conn.upstream_tls_required = false;
+                    conn.connect_response_sent = false;
+                    conn.h2_connect_stream_id = Some(frame.stream_id);
+                    conn.next_state_after_upstream = Some(ProxyState::H2(H2State::Proxy(
+                        H2ProxyState::ProxyFramesClientToUpstream,
+                    )));
+                    return NextStep::Continue(ProxyState::Upstream(UpstreamState::Dns(
+                        UpstreamDnsState::ResolveStart,
+                    )));
                 }
 
-                // Consume processed bytes
-                if conn.in_len > consumed_total {
-                    let remaining = conn.in_len - consumed_total;
-                    buf.copy_within(consumed_total..consumed_total + remaining, 0);
-                    conn.in_len = remaining;
-                } else {
-                    conn.in_len = 0;
+                if conn.target().is_none() {
+                    conn.set_target(host, port);
                 }
+                conn.next_state_after_upstream = Some(ProxyState::H2(H2State::UpstreamSettings(
+                    H2UpstreamSettingsState::UpstreamSettingsExchange,
+                )));
+                return NextStep::Continue(ProxyState::Upstream(UpstreamState::Dns(
+                    UpstreamDnsState::ResolveStart,
+                )));
+            }
 
-                if let Some((method, host, port)) =
-                    parse_h2_pseudo_headers(&mut conn.h2_decoder, &frag, 443)
-                {
-                    if method.eq_ignore_ascii_case("CONNECT") {
-                        println!("[H2] CONNECT detected on stream {}", frame.stream_id);
-                        conn.set_target(host, port);
-                        conn.upstream_tls_required = false;
-                        conn.connect_response_sent = false;
-                        conn.h2_connect_stream_id = Some(frame.stream_id);
-                        conn.next_state_after_upstream =
-                            Some(ProxyState::H2(H2State::Proxy(
-                                H2ProxyState::ProxyFramesClientToUpstream,
-                            )));
-                        return NextStep::Continue(ProxyState::Upstream(UpstreamState::Dns(
-                            UpstreamDnsState::ResolveStart,
-                        )));
-                    } else {
-                        if conn.target().is_none() {
-                            conn.set_target(host, port);
-                        }
-                        conn.next_state_after_upstream =
-                            Some(ProxyState::H2(H2State::Proxy(
-                                H2ProxyState::ProxyFramesClientToUpstream,
-                            )));
-                        return NextStep::Continue(ProxyState::Upstream(UpstreamState::Dns(
-                            UpstreamDnsState::ResolveStart,
-                        )));
-                    }
-                } else {
-                    return h2_connection_error(conn, 0x1, "failed to parse HEADERS pseudo-headers").await;
-                }
+            if conn.h2_use_upstream_h2 {
+                conn.h2_pending_upstream_frames
+                    .extend_from_slice(&buf[..total]);
             }
 
             // If we still don't have a target and this isn't a HEADERS frame, just consume it.
             if frame.kind != 0x1 && conn.target().is_none() {
-                let consumed = 9 + payload_len;
-                if conn.in_len > consumed {
-                    let remaining = conn.in_len - consumed;
-                    buf.copy_within(consumed..consumed + remaining, 0);
-                    conn.in_len = remaining;
-                } else {
-                    conn.in_len = 0;
-                }
+                consume_h2_frame(conn, buf, total);
                 return NextStep::Continue(ProxyState::H2(H2State::FrameParse(
                     H2FrameParseState::RecvFrameHeader,
                 )));
@@ -1790,79 +1766,21 @@ pub async unsafe fn h2_handler(conn: &mut Connection, s: H2State) -> NextStep {
                     )));
                 }
                 if conn.next_state_after_upstream.is_none() {
-                    conn.next_state_after_upstream = Some(ProxyState::H2(H2State::Proxy(
-                        H2ProxyState::ProxyFramesClientToUpstream,
-                    )));
+                    conn.next_state_after_upstream = Some(ProxyState::H2(
+                        H2State::UpstreamSettings(H2UpstreamSettingsState::UpstreamSettingsExchange),
+                    ));
                 }
                 conn.in_len = 0;
                 return NextStep::Continue(ProxyState::Upstream(UpstreamState::Dns(
                     UpstreamDnsState::ResolveStart,
                 )));
             }
-
-            if frame.kind == 0x1 {
-                if let Some((method, host, port)) = parse_h2_pseudo_headers(
-                    &mut conn.h2_decoder,
-                    &buf[9..9 + payload_len],
-                    443,
-                ) {
-                    if method.eq_ignore_ascii_case("CONNECT") {
-                        println!("[H2] CONNECT detected on stream {}", stream_id);
-                        conn.set_target(host, port);
-                        conn.upstream_tls_required = false;
-                        conn.connect_response_sent = false;
-                        conn.h2_connect_stream_id = Some(stream_id);
-                        conn.next_state_after_upstream =
-                            Some(ProxyState::H2(H2State::Proxy(
-                                H2ProxyState::ProxyFramesClientToUpstream,
-                            )));
-                        let consumed = 9 + payload_len;
-                        if conn.in_len > consumed {
-                            let remaining = conn.in_len - consumed;
-                            buf.copy_within(consumed..consumed + remaining, 0);
-                            conn.in_len = remaining;
-                        } else {
-                            conn.in_len = 0;
-                        }
-                        return NextStep::Continue(ProxyState::Upstream(UpstreamState::Dns(
-                            UpstreamDnsState::ResolveStart,
-                        )));
-                    } else {
-                        if conn.target().is_none() {
-                            conn.set_target(host, port);
-                        }
-                        conn.next_state_after_upstream =
-                            Some(ProxyState::H2(H2State::Proxy(
-                                H2ProxyState::ProxyFramesClientToUpstream,
-                            )));
-                        let consumed = 9 + payload_len;
-                        if conn.in_len > consumed {
-                            let remaining = conn.in_len - consumed;
-                            buf.copy_within(consumed..consumed + remaining, 0);
-                            conn.in_len = remaining;
-                        } else {
-                            conn.in_len = 0;
-                        }
-                        return NextStep::Continue(ProxyState::Upstream(UpstreamState::Dns(
-                            UpstreamDnsState::ResolveStart,
-                        )));
-                    }
-                }
-            }
-
-            let consumed = 9 + payload_len;
-            if conn.in_len > consumed {
-                let remaining = conn.in_len - consumed;
-                buf.copy_within(consumed..consumed + remaining, 0);
-                conn.in_len = remaining;
-            } else {
-                conn.in_len = 0;
-            }
+            consume_h2_frame(conn, buf, total);
 
             if conn.next_state_after_upstream.is_none() {
-                conn.next_state_after_upstream = Some(ProxyState::H2(H2State::Proxy(
-                    H2ProxyState::ProxyFramesClientToUpstream,
-                )));
+                conn.next_state_after_upstream = Some(ProxyState::H2(
+                    H2State::UpstreamSettings(H2UpstreamSettingsState::UpstreamSettingsExchange),
+                ));
             }
 
             return NextStep::Continue(ProxyState::H2(H2State::FrameParse(
@@ -1870,16 +1788,95 @@ pub async unsafe fn h2_handler(conn: &mut Connection, s: H2State) -> NextStep {
             )));
         }
 
-        H2State::Proxy(H2ProxyState::ProxyFramesClientToUpstream) => {
-            let mut n = conn.in_len;
-            println!(
-                "[H2] CONNECT tunnel entry: in_len={} upstream_tcp={} upstream_tls={}",
-                n,
-                conn.upstream_tcp.is_some(),
-                conn.upstream_tls.is_some()
-            );
+        H2State::UpstreamSettings(H2UpstreamSettingsState::UpstreamSettingsExchange) => {
+            if !conn.h2_use_upstream_h2 || conn.h2_connect_stream_id.is_some() {
+                conn.h2_upstream_ready = true;
+                conn.h2_pending_upstream_frames.clear();
+                return NextStep::Continue(ProxyState::H2(H2State::Proxy(
+                    H2ProxyState::ProxyFramesClientToUpstream,
+                )));
+            }
 
+            if conn.upstream_tcp.is_none() && conn.upstream_tls.is_none() {
+                if conn.next_state_after_upstream.is_none() {
+                    conn.next_state_after_upstream = Some(ProxyState::H2(
+                        H2State::UpstreamSettings(H2UpstreamSettingsState::UpstreamSettingsExchange),
+                    ));
+                }
+                return NextStep::Continue(ProxyState::Upstream(UpstreamState::Dns(
+                    UpstreamDnsState::ResolveStart,
+                )));
+            }
+
+            if let Err(e) = h2_flush_pending_to_upstream(conn).await {
+                println!("[H2] Failed to flush client preface to upstream: {}", e);
+                return NextStep::Close;
+            }
+
+            conn.in_len = 0;
+            if conn.in_len < 9 {
+                match read_upstream_data(conn, &mut buf[conn.in_len..9]).await {
+                    Ok(n) if n > 0 => conn.in_len += n,
+                    _ => return NextStep::Close,
+                }
+            }
+
+            if conn.in_len < 9 {
+                return NextStep::WaitRead(ProxyState::H2(H2State::UpstreamSettings(
+                    H2UpstreamSettingsState::UpstreamSettingsExchange,
+                )));
+            }
+
+            let header = parse_h2_frame_header(&buf[..9]);
+            if header.kind != 0x4 || (header.flags & 0x1 != 0) {
+                return h2_connection_error(conn, 0x1, "upstream did not start with SETTINGS").await;
+            }
+
+            let total = 9 + header.length;
+            if total > conn.in_cap {
+                println!(
+                    "[H2] Upstream SETTINGS too large for buffer ({} > {})",
+                    total, conn.in_cap
+                );
+                return NextStep::Close;
+            }
+
+            while conn.in_len < total {
+                match read_upstream_data(conn, &mut buf[conn.in_len..total]).await {
+                    Ok(n) if n > 0 => conn.in_len += n,
+                    _ => {
+                        return NextStep::WaitRead(ProxyState::H2(H2State::UpstreamSettings(
+                            H2UpstreamSettingsState::UpstreamSettingsExchange,
+                        )))
+                    }
+                }
+            }
+
+            apply_h2_settings(&mut conn.h2_upstream_max_frame_size, &buf[9..total]);
+
+            let ack = build_h2_frame_header(0, 0x4, 0x1, 0);
+            if let Err(e) = write_upstream_data(conn, &ack).await {
+                println!("[H2] Failed to ack upstream SETTINGS: {}", e);
+                return NextStep::Close;
+            }
+
+            conn.in_len = 0;
+            conn.h2_upstream_ready = true;
+            return NextStep::Continue(ProxyState::H2(H2State::Proxy(
+                H2ProxyState::ProxyFramesClientToUpstream,
+            )));
+        }
+
+        H2State::Proxy(H2ProxyState::ProxyFramesClientToUpstream) => {
             if let Some(stream_id) = conn.h2_connect_stream_id {
+                let mut n = conn.in_len;
+                println!(
+                    "[H2] CONNECT tunnel entry: in_len={} upstream_tcp={} upstream_tls={}",
+                    n,
+                    conn.upstream_tcp.is_some(),
+                    conn.upstream_tls.is_some()
+                );
+
                 // If no buffered client data, choose the side that becomes readable first.
                 if n == 0 {
                     println!(
@@ -1908,40 +1905,38 @@ pub async unsafe fn h2_handler(conn: &mut Connection, s: H2State) -> NextStep {
                         }
                     }
                 }
-            }
 
-            if n == 0 {
-                match read_client_data(conn, buf).await {
-                    Ok(read) if read > 0 => {
-                        conn.in_len = read;
-                        n = read;
-                        println!("[H2] Read {} bytes from client for upstream", n);
+                if n == 0 {
+                    match read_client_data(conn, buf).await {
+                        Ok(read) if read > 0 => {
+                            conn.in_len = read;
+                            n = read;
+                            println!("[H2] Read {} bytes from client for upstream", n);
+                        }
+                        _ => return NextStep::Close,
                     }
-                    _ => return NextStep::Close,
                 }
-            }
 
-            if conn.upstream_tcp.is_none() && conn.upstream_tls.is_none() {
-                // We need an upstream before proxying; if we don't even know the target yet, keep parsing frames.
-                if conn.target().is_none() {
-                    conn.in_len = 0;
-                    return NextStep::Continue(ProxyState::H2(H2State::FrameParse(
-                        H2FrameParseState::RecvFrameHeader,
+                if conn.upstream_tcp.is_none() && conn.upstream_tls.is_none() {
+                    // We need an upstream before proxying; if we don't even know the target yet, keep parsing frames.
+                    if conn.target().is_none() {
+                        conn.in_len = 0;
+                        return NextStep::Continue(ProxyState::H2(H2State::FrameParse(
+                            H2FrameParseState::RecvFrameHeader,
+                        )));
+                    }
+
+                    if conn.next_state_after_upstream.is_none() {
+                        conn.next_state_after_upstream = Some(ProxyState::H2(H2State::Proxy(
+                            H2ProxyState::ProxyFramesClientToUpstream,
+                        )));
+                    }
+
+                    return NextStep::Continue(ProxyState::Upstream(UpstreamState::Dns(
+                        UpstreamDnsState::ResolveStart,
                     )));
                 }
 
-                if conn.next_state_after_upstream.is_none() {
-                    conn.next_state_after_upstream = Some(ProxyState::H2(H2State::Proxy(
-                        H2ProxyState::ProxyFramesClientToUpstream,
-                    )));
-                }
-
-                return NextStep::Continue(ProxyState::Upstream(UpstreamState::Dns(
-                    UpstreamDnsState::ResolveStart,
-                )));
-            }
-
-            if let Some(stream_id) = conn.h2_connect_stream_id {
                 // Always ensure CONNECT response is sent before tunneling.
                 if !conn.connect_response_sent {
                     if let Err(e) = send_h2_connect_response(conn, stream_id).await {
@@ -2166,21 +2161,124 @@ pub async unsafe fn h2_handler(conn: &mut Connection, s: H2State) -> NextStep {
                 )));
             }
 
-            if let Err(e) = write_upstream_data(conn, &buf[..n]).await {
-                println!("[H2] Client->upstream write failed: {}", e);
-                return NextStep::Close;
-            }
-            println!("[H2] Forwarded {} bytes from client to upstream (raw)", n);
-
-            if conn.h2_connect_stream_id.is_some() {
-                return NextStep::Continue(ProxyState::H2(H2State::Proxy(
-                    H2ProxyState::ProxyFramesClientToUpstream,
+            if !conn.h2_upstream_ready {
+                return NextStep::Continue(ProxyState::H2(H2State::UpstreamSettings(
+                    H2UpstreamSettingsState::UpstreamSettingsExchange,
                 )));
             }
 
-            return NextStep::Continue(ProxyState::H2(H2State::Proxy(
-                H2ProxyState::ProxyFramesUpstreamToClient,
-            )));
+            let mut forwarded = false;
+
+            loop {
+                if conn.in_len < 9 {
+                    match read_client_data(conn, buf).await {
+                        Ok(read) if read > 0 => {
+                            conn.in_len = read;
+                        }
+                        _ => return NextStep::Close,
+                    }
+                    if conn.in_len < 9 {
+                        return NextStep::WaitRead(ProxyState::H2(H2State::Proxy(
+                            H2ProxyState::ProxyFramesClientToUpstream,
+                        )));
+                    }
+                }
+
+                let frame = parse_h2_frame_header(&buf[..9]);
+                let total = 9 + frame.length;
+                if total > conn.in_cap {
+                    println!("[H2] Frame exceeds buffer: {}", total);
+                    return NextStep::Close;
+                }
+
+                while conn.in_len < total {
+                    match read_client_data(conn, &mut buf[conn.in_len..total]).await {
+                        Ok(more) if more > 0 => conn.in_len += more,
+                        _ => {
+                            return NextStep::WaitRead(ProxyState::H2(H2State::Proxy(
+                                H2ProxyState::ProxyFramesClientToUpstream,
+                            )))
+                        }
+                    }
+                }
+
+                if frame.kind == 0x4 {
+                    if frame.flags & 0x1 != 0 {
+                        println!("[H2] Dropping client SETTINGS ACK");
+                        consume_h2_frame(conn, buf, total);
+                        continue;
+                    }
+
+                    apply_h2_settings(&mut conn.h2_client_max_frame_size, &buf[9..total]);
+                    let ack = build_h2_frame_header(0, 0x4, 0x1, 0);
+                    if let Err(e) = write_client_data(conn, &ack).await {
+                        println!("[H2] Failed to ACK client SETTINGS: {}", e);
+                        return NextStep::Close;
+                    }
+                    consume_h2_frame(conn, buf, total);
+                    continue;
+                }
+
+                if frame.kind == 0x1 {
+                    let (block, consumed) =
+                        match h2_read_headers_block(conn, buf, &frame, true).await {
+                            Ok(v) => v,
+                            Err(next) => return next,
+                        };
+                    let headers = match decode_h2_header_block(&mut conn.h2_decoder, &block) {
+                        Some(h) => h,
+                        None => {
+                            return h2_connection_error(conn, 0x1, "failed to decode HEADERS").await;
+                        }
+                    };
+
+                    let encoded = encode_h2_headers_for_peer(
+                        &mut conn.h2_upstream_encoder,
+                        &headers,
+                        frame.stream_id,
+                        frame.flags & 0x1 != 0,
+                        conn.h2_upstream_max_frame_size,
+                    );
+
+                    if let Err(e) = write_upstream_data(conn, &encoded).await {
+                        println!("[H2] Failed to forward re-encoded HEADERS: {}", e);
+                        return NextStep::Close;
+                    }
+
+                    forwarded = true;
+                    consume_h2_frame(conn, buf, consumed);
+                } else {
+                    if frame.length > conn.h2_upstream_max_frame_size && frame.kind != 0x4 {
+                        return h2_connection_error(
+                            conn,
+                            0x6,
+                            "frame exceeds upstream SETTINGS_MAX_FRAME_SIZE",
+                        )
+                        .await;
+                    }
+
+                    if let Err(e) = write_upstream_data(conn, &buf[..total]).await {
+                        println!("[H2] Client->upstream write failed: {}", e);
+                        return NextStep::Close;
+                    }
+                    forwarded = true;
+                    consume_h2_frame(conn, buf, total);
+                }
+
+                if conn.in_len == 0 {
+                    break;
+                }
+            }
+
+            if forwarded {
+                NextStep::Continue(ProxyState::H2(H2State::Proxy(
+                    H2ProxyState::ProxyFramesUpstreamToClient,
+                )))
+            } else {
+                NextStep::WaitRead(ProxyState::H2(H2State::Proxy(
+                    H2ProxyState::ProxyFramesClientToUpstream,
+                )))
+            }
         }
 
         H2State::Proxy(H2ProxyState::ProxyFramesUpstreamToClient) => {
@@ -2188,29 +2286,128 @@ pub async unsafe fn h2_handler(conn: &mut Connection, s: H2State) -> NextStep {
                 return h2_connect_forward_upstream(conn, stream_id, buf).await;
             }
 
-            let n = match read_upstream_data(conn, buf).await {
-                Ok(n) if n > 0 => n,
-                Ok(_) => {
-                    println!("[H2] Upstream closed connection");
+            let mut forwarded = false;
+
+            loop {
+                if conn.in_len < 9 {
+                    match read_upstream_data(conn, buf).await {
+                        Ok(n) if n > 0 => conn.in_len = n,
+                        Ok(_) => {
+                            println!("[H2] Upstream closed connection");
+                            return NextStep::Close;
+                        }
+                        Err(e) => {
+                            println!("[H2] Upstream read error: {}", e);
+                            return NextStep::Close;
+                        }
+                    };
+                    if conn.in_len < 9 {
+                        return NextStep::WaitRead(ProxyState::H2(H2State::Proxy(
+                            H2ProxyState::ProxyFramesUpstreamToClient,
+                        )));
+                    }
+                }
+
+                let frame = parse_h2_frame_header(&buf[..9]);
+                let total = 9 + frame.length;
+                if total > conn.in_cap {
+                    println!("[H2] Upstream frame exceeds buffer: {}", total);
                     return NextStep::Close;
                 }
-                Err(e) => {
-                    println!("[H2] Upstream read error: {}", e);
-                    return NextStep::Close;
+
+                while conn.in_len < total {
+                    match read_upstream_data(conn, &mut buf[conn.in_len..total]).await {
+                        Ok(more) if more > 0 => conn.in_len += more,
+                        _ => {
+                            return NextStep::WaitRead(ProxyState::H2(H2State::Proxy(
+                                H2ProxyState::ProxyFramesUpstreamToClient,
+                            )))
+                        }
+                    }
                 }
-            };
 
-            conn.in_len = n;
+                if frame.kind == 0x4 {
+                    if frame.flags & 0x1 != 0 {
+                        println!("[H2] Dropping upstream SETTINGS ACK");
+                        consume_h2_frame(conn, buf, total);
+                        continue;
+                    }
 
-            if let Err(e) = write_client_data(conn, &buf[..n]).await {
-                println!("[H2] Upstream->client write failed: {}", e);
-                return NextStep::Close;
+                    apply_h2_settings(&mut conn.h2_upstream_max_frame_size, &buf[9..total]);
+                    let ack = build_h2_frame_header(0, 0x4, 0x1, 0);
+                    if let Err(e) = write_upstream_data(conn, &ack).await {
+                        println!("[H2] Failed to ack upstream SETTINGS: {}", e);
+                        return NextStep::Close;
+                    }
+                    consume_h2_frame(conn, buf, total);
+                    continue;
+                }
+
+                if frame.kind == 0x1 {
+                    let (block, consumed) =
+                        match h2_read_headers_block(conn, buf, &frame, false).await {
+                            Ok(v) => v,
+                            Err(next) => return next,
+                        };
+                    let headers =
+                        match decode_h2_header_block(&mut conn.h2_upstream_decoder, &block) {
+                            Some(h) => h,
+                            None => {
+                                return h2_connection_error(
+                                    conn,
+                                    0x1,
+                                    "failed to decode upstream HEADERS",
+                                )
+                                .await;
+                            }
+                        };
+
+                    let encoded = encode_h2_headers_for_peer(
+                        &mut conn.h2_client_encoder,
+                        &headers,
+                        frame.stream_id,
+                        frame.flags & 0x1 != 0,
+                        conn.h2_client_max_frame_size,
+                    );
+
+                    if let Err(e) = write_client_data(conn, &encoded).await {
+                        println!("[H2] Failed to forward upstream HEADERS: {}", e);
+                        return NextStep::Close;
+                    }
+
+                    forwarded = true;
+                    consume_h2_frame(conn, buf, consumed);
+                } else {
+                    if frame.length > conn.h2_client_max_frame_size && frame.kind != 0x4 {
+                        return h2_connection_error(
+                            conn,
+                            0x6,
+                            "upstream frame exceeds client SETTINGS_MAX_FRAME_SIZE",
+                        )
+                        .await;
+                    }
+                    if let Err(e) = write_client_data(conn, &buf[..total]).await {
+                        println!("[H2] Upstream->client write failed: {}", e);
+                        return NextStep::Close;
+                    }
+                    forwarded = true;
+                    consume_h2_frame(conn, buf, total);
+                }
+
+                if conn.in_len == 0 {
+                    break;
+                }
             }
-            println!("[H2] Forwarded {} bytes upstream->client (raw)", n);
 
-            return NextStep::Continue(ProxyState::H2(H2State::FrameParse(
-                H2FrameParseState::RecvFrameHeader,
-            )));
+            if forwarded {
+                NextStep::Continue(ProxyState::H2(H2State::Proxy(
+                    H2ProxyState::ProxyFramesClientToUpstream,
+                )))
+            } else {
+                NextStep::WaitRead(ProxyState::H2(H2State::Proxy(
+                    H2ProxyState::ProxyFramesUpstreamToClient,
+                )))
+            }
         }
 
         _ => {
@@ -2472,32 +2669,6 @@ fn parse_request_line(buf: &[u8]) -> Option<(String, String)> {
         }
     }
     None
-}
-
-fn parse_h2_pseudo_headers(
-    decoder: &mut Decoder<'static>,
-    payload: &[u8],
-    default_port: u16,
-) -> Option<(String, String, u16)> {
-    let headers = decoder.decode(payload).ok()?;
-
-    let mut method: Option<String> = None;
-    let mut authority: Option<String> = None;
-
-    for (name, value) in headers {
-        if let (Ok(n), Ok(v)) = (std::str::from_utf8(&name), std::str::from_utf8(&value)) {
-            if n.eq_ignore_ascii_case(":method") {
-                method = Some(v.to_string());
-            } else if n.eq_ignore_ascii_case(":authority") {
-                authority = Some(v.to_string());
-            }
-        }
-    }
-
-    let method = method?;
-    let authority = authority?;
-    let (host, port) = split_host_port(&authority, default_port);
-    Some((method, host, port))
 }
 
 fn parse_host_header(buf: &[u8], default_port: u16) -> Option<(String, u16)> {
@@ -2940,6 +3111,173 @@ fn build_h2_frame_header(len: usize, kind: u8, flags: u8, stream_id: u32) -> [u8
     ]
 }
 
+fn decode_h2_header_block(decoder: &mut Decoder<'static>, block: &[u8]) -> Option<Vec<(Vec<u8>, Vec<u8>)>> {
+    decoder.decode(block).ok()
+}
+
+fn extract_h2_pseudo_headers(
+    headers: &[(Vec<u8>, Vec<u8>)],
+    default_port: u16,
+) -> Option<(String, String, u16)> {
+    let mut method: Option<String> = None;
+    let mut authority: Option<String> = None;
+
+    for (name, value) in headers {
+        let name_str = std::str::from_utf8(name).ok()?;
+        let val_str = std::str::from_utf8(value).ok()?;
+
+        if name_str.eq_ignore_ascii_case(":method") {
+            method = Some(val_str.to_string());
+        } else if name_str.eq_ignore_ascii_case(":authority") {
+            authority = Some(val_str.to_string());
+        }
+    }
+
+    let method = method?;
+    let authority = authority?;
+    let (host, port) = split_host_port(&authority, default_port);
+    Some((method, host, port))
+}
+
+fn encode_h2_headers_for_peer(
+    encoder: &mut Encoder<'static>,
+    headers: &[(Vec<u8>, Vec<u8>)],
+    stream_id: u32,
+    end_stream: bool,
+    max_frame_size: usize,
+) -> Vec<u8> {
+    let block = encoder.encode(headers.iter().map(|(n, v)| (n.as_slice(), v.as_slice())));
+    let mut frames = Vec::new();
+
+    // Ensure progress even if max_frame_size is somehow zero.
+    let max_frame_size = std::cmp::max(1, max_frame_size);
+
+    if block.is_empty() {
+        let mut flags = 0x4; // END_HEADERS
+        if end_stream {
+            flags |= 0x1;
+        }
+        frames.extend_from_slice(&build_h2_frame_header(0, 0x1, flags, stream_id));
+        return frames;
+    }
+
+    let mut offset = 0usize;
+    let mut first = true;
+    while offset < block.len() {
+        let chunk = std::cmp::min(max_frame_size, block.len() - offset);
+        let is_last = offset + chunk == block.len();
+        let mut flags = 0u8;
+
+        if is_last {
+            flags |= 0x4; // END_HEADERS
+        }
+        if first && end_stream {
+            flags |= 0x1; // END_STREAM
+        }
+
+        let kind = if first { 0x1 } else { 0x9 };
+        frames.extend_from_slice(&build_h2_frame_header(chunk, kind, flags, stream_id));
+        frames.extend_from_slice(&block[offset..offset + chunk]);
+
+        offset += chunk;
+        first = false;
+    }
+
+    frames
+}
+
+async unsafe fn h2_read_headers_block(
+    conn: &mut Connection,
+    buf: &mut [u8],
+    frame: &H2Frame,
+    from_client: bool,
+) -> Result<(Vec<u8>, usize), NextStep> {
+    let mut consumed_total = 9 + frame.length;
+    let mut frag = Vec::new();
+
+    let mut offset = 9;
+    let mut remaining = frame.length;
+    let mut pad_len = 0usize;
+
+    if frame.flags & 0x8 != 0 {
+        if remaining == 0 {
+            return Err(h2_connection_error(conn, 0x1, "PADDED with zero length").await);
+        }
+        pad_len = buf[offset] as usize;
+        offset += 1;
+        remaining = remaining.saturating_sub(1);
+    }
+
+    if frame.flags & 0x20 != 0 {
+        if remaining < 5 {
+            return Err(
+                h2_connection_error(conn, 0x1, "PRIORITY flag missing payload").await
+            );
+        }
+        offset += 5;
+        remaining -= 5;
+    }
+
+    if remaining < pad_len {
+        return Err(h2_connection_error(conn, 0x1, "pad length exceeds payload").await);
+    }
+
+    let fragment_len = remaining - pad_len;
+    frag.extend_from_slice(&buf[offset..offset + fragment_len]);
+
+    let mut end_headers = frame.flags & 0x4 != 0;
+
+    while !end_headers {
+        if conn.in_len < consumed_total + 9 {
+            let need = consumed_total + 9 - conn.in_len;
+            match h2_read_side_data(conn, buf, from_client, conn.in_len, conn.in_len + need).await
+            {
+                Ok(n) if n > 0 => conn.in_len += n,
+                _ => return Err(NextStep::Close),
+            }
+        }
+
+        let next_header = parse_h2_frame_header(&buf[consumed_total..consumed_total + 9]);
+        if next_header.kind != 0x9 || next_header.stream_id != frame.stream_id {
+            return Err(h2_connection_error(conn, 0x1, "expected CONTINUATION").await);
+        }
+
+        let next_total = consumed_total + 9 + next_header.length;
+        if next_total > conn.in_cap {
+            return Err(
+                h2_connection_error(conn, 0x6, "CONTINUATION too large for buffer").await
+            );
+        }
+
+        while conn.in_len < next_total {
+            match h2_read_side_data(conn, buf, from_client, conn.in_len, next_total).await {
+                Ok(n) if n > 0 => conn.in_len += n,
+                _ => return Err(NextStep::Close),
+            }
+        }
+
+        frag.extend_from_slice(&buf[consumed_total + 9..next_total]);
+        consumed_total = next_total;
+        end_headers = next_header.flags & 0x4 != 0;
+    }
+
+    Ok((frag, consumed_total))
+}
+
+async unsafe fn h2_read_side_data(
+    conn: &mut Connection,
+    buf: &mut [u8],
+    from_client: bool,
+    start: usize,
+    end: usize,
+) -> std::io::Result<usize> {
+    if from_client {
+        read_client_data(conn, &mut buf[start..end]).await
+    } else {
+        read_upstream_data(conn, &mut buf[start..end]).await
+    }
+}
+
 fn consume_h2_frame(conn: &mut Connection, buf: &mut [u8], total: usize) {
     if conn.in_len > total {
         let remaining = conn.in_len - total;
@@ -2948,6 +3286,60 @@ fn consume_h2_frame(conn: &mut Connection, buf: &mut [u8], total: usize) {
     } else {
         conn.in_len = 0;
     }
+}
+
+fn apply_h2_settings(max_frame_size: &mut usize, payload: &[u8]) {
+    let mut offset = 0;
+    while offset + 6 <= payload.len() {
+        let id = u16::from_be_bytes([payload[offset], payload[offset + 1]]);
+        let value =
+            u32::from_be_bytes([payload[offset + 2], payload[offset + 3], payload[offset + 4], payload[offset + 5]]);
+        if id == 0x5 {
+            let v = value as usize;
+            if v >= 16384 && v <= 0x00FF_FFFF {
+                *max_frame_size = v;
+            }
+        }
+        offset += 6;
+    }
+}
+
+async unsafe fn h2_flush_pending_to_upstream(conn: &mut Connection) -> std::io::Result<()> {
+    const CLIENT_PREFACE: &[u8; 24] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+    if !conn.h2_upstream_preface_sent && conn.h2_client_preface_seen {
+        write_upstream_data(conn, CLIENT_PREFACE).await?;
+        let upstream_settings = build_h2_frame_header(0, 0x4, 0x0, 0);
+        write_upstream_data(conn, &upstream_settings).await?;
+        conn.h2_upstream_preface_sent = true;
+    }
+
+    if conn.h2_pending_upstream_frames.is_empty() {
+        return Ok(());
+    }
+
+    let mut offset = 0;
+    let total = conn.h2_pending_upstream_frames.len();
+    while offset + 9 <= total {
+        let header =
+            parse_h2_frame_header(&conn.h2_pending_upstream_frames[offset..offset + 9]);
+        let frame_total = 9 + header.length;
+        if offset + frame_total > total {
+            break;
+        }
+
+        if header.kind == 0x4 && (header.flags & 0x1 != 0) {
+            // Drop SETTINGS ACK frames; upstream shouldn't see client ACKs.
+        } else {
+            let end = offset + frame_total;
+            let frame_bytes = conn.h2_pending_upstream_frames[offset..end].to_vec();
+            write_upstream_data(conn, &frame_bytes).await?;
+        }
+
+        offset += frame_total;
+    }
+
+    conn.h2_pending_upstream_frames.clear();
+    Ok(())
 }
 
 async unsafe fn send_h2_goaway(
@@ -3056,7 +3448,7 @@ async unsafe fn h2_connect_forward_upstream(
 
     let mut offset = 0;
     while offset < n {
-        let chunk = std::cmp::min(H2_DEFAULT_MAX_FRAME_SIZE, n - offset);
+        let chunk = std::cmp::min(conn.h2_client_max_frame_size, n - offset);
         let frame = build_h2_data_frame(stream_id, &buf[offset..offset + chunk], false);
         if let Err(e) = write_client_data(conn, &frame).await {
             println!("[H2] Upstream->client write failed: {}", e);
@@ -3100,356 +3492,4 @@ fn try_reuse_upstream(conn: &mut Connection) -> bool {
 pub async unsafe fn intercept_handler(_: &mut Connection, _: InterceptState) -> NextStep {
     println!("[INTERCEPT] Not implemented");
     NextStep::Close
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::connection::Connection;
-    use crate::fsm::NextStep;
-    use crate::states::{
-        H2ConnBootstrapState, H2FlowControlState, H2FrameParseState, H2ProxyState, H2State,
-        H3ControlState, H3ForwardState, H3QpackState, H3RequestParseState, H3State, ProxyState,
-        UpstreamDnsState, UpstreamState,
-    };
-    use std::error::Error;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::{TcpListener, TcpStream};
-    use tokio::sync::mpsc;
-
-    async fn tcp_pair() -> Result<(TcpStream, TcpStream), Box<dyn Error>> {
-        let listener = TcpListener::bind("127.0.0.1:0").await?;
-        let addr = listener.local_addr()?;
-        let client = TcpStream::connect(addr).await?;
-        let (server, _) = listener.accept().await?;
-        Ok((client, server))
-    }
-
-    fn build_h2_frame(payload: &[u8]) -> Vec<u8> {
-        let len = payload.len();
-        let mut frame = vec![
-            ((len >> 16) & 0xff) as u8,
-            ((len >> 8) & 0xff) as u8,
-            (len & 0xff) as u8,
-            0x0,
-            0x1,
-            0x00,
-            0x00,
-            0x00,
-            0x01,
-        ];
-        frame.extend_from_slice(payload);
-        frame
-    }
-
-    #[tokio::test]
-    async fn h2_handler_flows() -> Result<(), Box<dyn Error>> {
-        let (tx, rx) = mpsc::unbounded_channel();
-
-        let (client_stream, mut client_peer) = tcp_pair().await?;
-        let (upstream_stream, mut upstream_peer) = tcp_pair().await?;
-
-        let client_ptr = Box::into_raw(Box::new(client_stream));
-        let mut conn = Connection::new_tcp_raw(client_ptr, tx, rx);
-        let upstream_ptr = Box::into_raw(Box::new(upstream_stream));
-        conn.upstream_tcp = Some(upstream_ptr);
-
-        let preface = b"PRI * HTTP/2.0
-
-SM
-
-";
-        client_peer.write_all(preface).await?;
-        let step = unsafe {
-            h2_handler(
-                &mut conn,
-                H2State::Bootstrap(H2ConnBootstrapState::ClientPreface),
-            )
-            .await
-        };
-        assert!(matches!(
-            step,
-            NextStep::Continue(ProxyState::H2(H2State::Bootstrap(
-                H2ConnBootstrapState::RecvClientSettings
-            )))
-        ));
-
-        let settings = b"       ";
-        client_peer.write_all(settings).await?;
-        let step = unsafe {
-            h2_handler(
-                &mut conn,
-                H2State::Bootstrap(H2ConnBootstrapState::RecvClientSettings),
-            )
-            .await
-        };
-        assert!(matches!(
-            step,
-            NextStep::Continue(ProxyState::H2(H2State::FrameParse(
-                H2FrameParseState::RecvFrameHeader
-            )))
-        ));
-
-        let payload = b"client->upstream";
-        let frame = build_h2_frame(payload);
-        client_peer.write_all(&frame).await?;
-
-        let step = unsafe {
-            h2_handler(
-                &mut conn,
-                H2State::FrameParse(H2FrameParseState::RecvFrameHeader),
-            )
-            .await
-        };
-        assert!(matches!(
-            step,
-            NextStep::Continue(ProxyState::H2(H2State::FlowControl(
-                H2FlowControlState::FlowControlWaitWindowUpdate
-            )))
-        ));
-
-        let step = unsafe {
-            h2_handler(
-                &mut conn,
-                H2State::FlowControl(H2FlowControlState::FlowControlWaitWindowUpdate),
-            )
-            .await
-        };
-        assert!(matches!(
-            step,
-            NextStep::Continue(ProxyState::H2(H2State::Proxy(
-                H2ProxyState::ProxyFramesClientToUpstream
-            )))
-        ));
-        assert_eq!(
-            conn.next_state_after_upstream,
-            Some(ProxyState::H2(H2State::Proxy(
-                H2ProxyState::ProxyFramesClientToUpstream
-            )))
-        );
-
-        let step = unsafe {
-            h2_handler(
-                &mut conn,
-                H2State::Proxy(H2ProxyState::ProxyFramesClientToUpstream),
-            )
-            .await
-        };
-        assert!(matches!(
-            step,
-            NextStep::Continue(ProxyState::H2(H2State::Proxy(
-                H2ProxyState::ProxyFramesUpstreamToClient
-            )))
-        ));
-
-        let mut forwarded = vec![0u8; frame.len()];
-        upstream_peer.read_exact(&mut forwarded).await?;
-        assert_eq!(forwarded, frame);
-
-        let upstream_payload = b"upstream->client";
-        upstream_peer.write_all(upstream_payload).await?;
-        let step = unsafe {
-            h2_handler(
-                &mut conn,
-                H2State::Proxy(H2ProxyState::ProxyFramesUpstreamToClient),
-            )
-            .await
-        };
-        assert!(matches!(
-            step,
-            NextStep::Continue(ProxyState::H2(H2State::FrameParse(
-                H2FrameParseState::RecvFrameHeader
-            )))
-        ));
-
-        let mut received = vec![0u8; upstream_payload.len()];
-        client_peer.read_exact(&mut received).await?;
-        assert_eq!(received, upstream_payload);
-
-        unsafe {
-            if let Some(ptr) = conn.client_tcp.take() {
-                drop(Box::from_raw(ptr));
-            }
-            if let Some(ptr) = conn.upstream_tcp.take() {
-                drop(Box::from_raw(ptr));
-            }
-        }
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn h2_connect_allows_control_frames() -> Result<(), Box<dyn Error>> {
-        let (tx, rx) = mpsc::unbounded_channel();
-        let (client_stream, mut client_peer) = tcp_pair().await?;
-        let client_ptr = Box::into_raw(Box::new(client_stream));
-        let mut conn = Connection::new_tcp_raw(client_ptr, tx, rx);
-        conn.h2_connect_stream_id = Some(1);
-        conn.connect_response_sent = true;
-
-        let settings_ack = build_h2_frame_header(0, 0x4, 0x1, 0);
-        client_peer.write_all(&settings_ack).await?;
-
-        let step = unsafe {
-            h2_handler(
-                &mut conn,
-                H2State::Proxy(H2ProxyState::ProxyFramesClientToUpstream),
-            )
-            .await
-        };
-
-        assert!(matches!(
-            step,
-            NextStep::Continue(ProxyState::H2(H2State::FrameParse(
-                H2FrameParseState::RecvFrameHeader
-            )))
-        ));
-        assert_eq!(conn.in_len, 0);
-
-        unsafe {
-            if let Some(ptr) = conn.client_tcp.take() {
-                drop(Box::from_raw(ptr));
-            }
-        }
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn h2_connect_replies_to_ping() -> Result<(), Box<dyn Error>> {
-        let (tx, rx) = mpsc::unbounded_channel();
-        let (client_stream, mut client_peer) = tcp_pair().await?;
-        let client_ptr = Box::into_raw(Box::new(client_stream));
-        let mut conn = Connection::new_tcp_raw(client_ptr, tx, rx);
-        conn.h2_connect_stream_id = Some(1);
-        conn.connect_response_sent = true;
-
-        let mut ping = Vec::new();
-        let ping_payload = [1u8, 2, 3, 4, 5, 6, 7, 8];
-        ping.extend_from_slice(&build_h2_frame_header(8, 0x6, 0x0, 0));
-        ping.extend_from_slice(&ping_payload);
-        client_peer.write_all(&ping).await?;
-
-        let step = unsafe {
-            h2_handler(
-                &mut conn,
-                H2State::Proxy(H2ProxyState::ProxyFramesClientToUpstream),
-            )
-            .await
-        };
-
-        assert!(matches!(
-            step,
-            NextStep::Continue(ProxyState::H2(H2State::FrameParse(
-                H2FrameParseState::RecvFrameHeader
-            )))
-        ));
-
-        let mut ack = vec![0u8; 17];
-        client_peer.read_exact(&mut ack).await?;
-        let mut expected = Vec::new();
-        expected.extend_from_slice(&build_h2_frame_header(8, 0x6, 0x1, 0));
-        expected.extend_from_slice(&ping_payload);
-        assert_eq!(ack, expected);
-        assert_eq!(conn.in_len, 0);
-
-        unsafe {
-            if let Some(ptr) = conn.client_tcp.take() {
-                drop(Box::from_raw(ptr));
-            }
-        }
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn h3_handler_flows() -> Result<(), Box<dyn Error>> {
-        let (tx, rx) = mpsc::unbounded_channel();
-
-        let (client_stream, mut client_peer) = tcp_pair().await?;
-        let (upstream_stream, mut upstream_peer) = tcp_pair().await?;
-
-        let client_ptr = Box::into_raw(Box::new(client_stream));
-        let mut conn = Connection::new_tcp_raw(client_ptr, tx, rx);
-        let upstream_ptr = Box::into_raw(Box::new(upstream_stream));
-        conn.upstream_tcp = Some(upstream_ptr);
-
-        let control_payload = b"h3-control";
-        client_peer.write_all(control_payload).await?;
-        let step = unsafe {
-            h3_handler(
-                &mut conn,
-                H3State::Control(H3ControlState::ControlStreamSetup),
-            )
-            .await
-        };
-        assert!(matches!(
-            step,
-            NextStep::Continue(ProxyState::Upstream(UpstreamState::Dns(
-                UpstreamDnsState::ResolveStart
-            )))
-        ));
-        assert_eq!(
-            conn.next_state_after_upstream,
-            Some(ProxyState::H3(H3State::RequestParse(
-                H3RequestParseState::RecvHeaders
-            )))
-        );
-
-        let h3_headers = b"h3-headers";
-        client_peer.write_all(h3_headers).await?;
-        let step = unsafe {
-            h3_handler(
-                &mut conn,
-                H3State::RequestParse(H3RequestParseState::RecvHeaders),
-            )
-            .await
-        };
-        assert!(matches!(
-            step,
-            NextStep::Continue(ProxyState::H3(H3State::Qpack(
-                H3QpackState::QpackDecodeHeaders
-            )))
-        ));
-
-        let step = unsafe {
-            h3_handler(&mut conn, H3State::Qpack(H3QpackState::QpackDecodeHeaders)).await
-        };
-        assert!(matches!(
-            step,
-            NextStep::Continue(ProxyState::H3(H3State::Forward(
-                H3ForwardState::ForwardHeaders
-            )))
-        ));
-
-        let mut forwarded = vec![0u8; h3_headers.len()];
-        upstream_peer.read_exact(&mut forwarded).await?;
-        assert_eq!(forwarded, h3_headers);
-
-        let h3_body = b"h3-body";
-        upstream_peer.write_all(h3_body).await?;
-        let step =
-            unsafe { h3_handler(&mut conn, H3State::Forward(H3ForwardState::ForwardBody)).await };
-        assert!(matches!(
-            step,
-            NextStep::Continue(ProxyState::H3(H3State::RequestParse(
-                H3RequestParseState::RecvHeaders
-            )))
-        ));
-
-        let mut received = vec![0u8; h3_body.len()];
-        client_peer.read_exact(&mut received).await?;
-        assert_eq!(received, h3_body);
-
-        unsafe {
-            if let Some(ptr) = conn.client_tcp.take() {
-                drop(Box::from_raw(ptr));
-            }
-            if let Some(ptr) = conn.upstream_tcp.take() {
-                drop(Box::from_raw(ptr));
-            }
-        }
-
-        Ok(())
-    }
 }

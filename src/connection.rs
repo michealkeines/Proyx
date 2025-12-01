@@ -5,6 +5,7 @@ use crate::controller::ControllerMsg;
 use crate::fsm::NextStep;
 use crate::handlers::*;
 use crate::states::{H1Session, ProxyState, TransportConnState};
+use hpack::{Decoder, Encoder};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::net::{UnixDatagram, UnixStream};
@@ -12,7 +13,6 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio_rustls::client::TlsStream as ClientTlsStream;
 use tokio_rustls::server::TlsStream as ServerTlsStream;
 type NestedServerTlsStream = ServerTlsStream<ServerTlsStream<TcpStream>>;
-use hpack::Decoder;
 
 #[derive(Debug, Clone, Copy)]
 pub enum ReadEnum {
@@ -128,6 +128,13 @@ pub struct Connection {
     pub h2_connect_stream_id: Option<u32>,
     pub negotiated_alpn: Option<String>,
     pub upstream_pool: Vec<PooledUpstream>,
+    pub h2_pending_upstream_frames: Vec<u8>,
+    pub h2_use_upstream_h2: bool,
+    pub h2_client_max_frame_size: usize,
+    pub h2_upstream_max_frame_size: usize,
+    pub h2_upstream_preface_sent: bool,
+    pub h2_client_preface_seen: bool,
+    pub h2_upstream_ready: bool,
 
     pub in_buf: NonNull<u8>,
     pub in_cap: usize,
@@ -143,6 +150,9 @@ pub struct Connection {
     pub scratch: u64,
     pub last_activity: std::time::Instant,
     pub h2_decoder: Decoder<'static>,
+    pub h2_upstream_decoder: Decoder<'static>,
+    pub h2_client_encoder: Encoder<'static>,
+    pub h2_upstream_encoder: Encoder<'static>,
 }
 
 impl Connection {
@@ -254,7 +264,17 @@ impl Connection {
             negotiated_alpn: None,
             last_activity: std::time::Instant::now(),
             upstream_pool: Vec::new(),
+            h2_pending_upstream_frames: Vec::new(),
+            h2_use_upstream_h2: true,
+            h2_client_max_frame_size: CONFIG.h2.max_frame_size,
+            h2_upstream_max_frame_size: CONFIG.h2.max_frame_size,
+            h2_upstream_preface_sent: false,
+            h2_client_preface_seen: false,
+            h2_upstream_ready: false,
             h2_decoder: Decoder::new(),
+            h2_upstream_decoder: Decoder::new(),
+            h2_client_encoder: Encoder::new(),
+            h2_upstream_encoder: Encoder::new(),
         }
     }
 

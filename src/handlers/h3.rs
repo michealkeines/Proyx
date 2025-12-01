@@ -1,11 +1,8 @@
-use crate::{
-    connection::Connection,
-    fsm::NextStep,
-    states::*,
-};
+use crate::{connection::Connection, fsm::NextStep, states::*};
 
 use super::shared::{
-    parse_connect_target, read_client_data, read_upstream_data, tunnel_copy, write_client_data, write_upstream_data,
+    parse_connect_target, read_client_data, read_upstream_data, tunnel_copy, write_client_data,
+    write_upstream_data,
 };
 
 pub async unsafe fn h3_handler(conn: &mut Connection, s: H3State) -> NextStep {
@@ -118,11 +115,8 @@ pub async unsafe fn h3_handler(conn: &mut Connection, s: H3State) -> NextStep {
             }
 
             if !conn.connect_response_sent {
-                let _ = write_client_data(
-                    conn,
-                    b"HTTP/1.1 200 Connection Established\r\n\r\n",
-                )
-                .await;
+                let _ =
+                    write_client_data(conn, b"HTTP/1.1 200 Connection Established\r\n\r\n").await;
                 conn.connect_response_sent = true;
             }
 

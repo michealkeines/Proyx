@@ -3,8 +3,8 @@ use std::sync::Arc;
 use rustls_pki_types::ServerName;
 use tokio::net::TcpStream;
 use tokio_rustls::{
-    rustls::{ClientConfig, RootCertStore},
     TlsConnector,
+    rustls::{ClientConfig, RootCertStore},
 };
 use webpki_roots::TLS_SERVER_ROOTS;
 
@@ -86,7 +86,9 @@ pub async unsafe fn upstream_handler(conn: &mut Connection, s: UpstreamState) ->
 
             let mut roots = RootCertStore::empty();
             let der_bytes = std::fs::read("/Users/michealkeines/Proyx/src/CA/root.der").unwrap();
-            roots.add(rustls_pki_types::CertificateDer::from(der_bytes)).unwrap();
+            roots
+                .add(rustls_pki_types::CertificateDer::from(der_bytes))
+                .unwrap();
             roots.extend(TLS_SERVER_ROOTS.iter().cloned());
 
             let mut cfg = ClientConfig::builder()
@@ -100,7 +102,9 @@ pub async unsafe fn upstream_handler(conn: &mut Connection, s: UpstreamState) ->
                 Ok(name) => name,
                 Err(_) => {
                     println!("[UPSTREAM] Invalid hostname for TLS handshake: {}", host);
-                unsafe { drop(tcp); }
+                    unsafe {
+                        drop(tcp);
+                    }
                     return NextStep::Close;
                 }
             };

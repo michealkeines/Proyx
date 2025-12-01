@@ -4,8 +4,8 @@ use crate::{
     connection::Connection,
     fsm::NextStep,
     states::{
-        DetectBootstrapState, DetectState, H1ConnectState, H1RequestParseState, H1State, ProxyState,
-        TlsHandshakeState, TlsState,
+        DetectBootstrapState, DetectState, H1ConnectState, H1RequestParseState, H1State,
+        ProxyState, TlsHandshakeState, TlsState,
     },
 };
 

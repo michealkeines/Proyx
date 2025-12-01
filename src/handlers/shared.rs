@@ -1,10 +1,13 @@
 use std::io::{Error, ErrorKind};
 
-use tokio::io::{copy_bidirectional, AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, copy_bidirectional};
 
 use crate::connection::Connection;
 
-pub async unsafe fn read_client_data(conn: &mut Connection, buf: &mut [u8]) -> std::io::Result<usize> {
+pub async unsafe fn read_client_data(
+    conn: &mut Connection,
+    buf: &mut [u8],
+) -> std::io::Result<usize> {
     debug_assert!(
         conn.client_mitm_tls.is_some() || conn.client_tls.is_some() || conn.client_tcp.is_some(),
         "read_client_data: expected at least one client transport"
@@ -80,10 +83,18 @@ pub async unsafe fn tunnel_copy(conn: &mut Connection) -> std::io::Result<()> {
         conn.upstream_tls.as_mut(),
         conn.upstream_tcp.as_mut(),
     ) {
-        (Some(c_tls), _, Some(u_tls), _) => copy_bidirectional(&mut **c_tls, &mut **u_tls).await.map(|_| ()),
-        (Some(c_tls), _, _, Some(u_tcp)) => copy_bidirectional(&mut **c_tls, &mut **u_tcp).await.map(|_| ()),
-        (_, Some(c_tcp), Some(u_tls), _) => copy_bidirectional(&mut **c_tcp, &mut **u_tls).await.map(|_| ()),
-        (_, Some(c_tcp), _, Some(u_tcp)) => copy_bidirectional(&mut **c_tcp, &mut **u_tcp).await.map(|_| ()),
+        (Some(c_tls), _, Some(u_tls), _) => copy_bidirectional(&mut **c_tls, &mut **u_tls)
+            .await
+            .map(|_| ()),
+        (Some(c_tls), _, _, Some(u_tcp)) => copy_bidirectional(&mut **c_tls, &mut **u_tcp)
+            .await
+            .map(|_| ()),
+        (_, Some(c_tcp), Some(u_tls), _) => copy_bidirectional(&mut **c_tcp, &mut **u_tls)
+            .await
+            .map(|_| ()),
+        (_, Some(c_tcp), _, Some(u_tcp)) => copy_bidirectional(&mut **c_tcp, &mut **u_tcp)
+            .await
+            .map(|_| ()),
         _ => Err(Error::new(
             ErrorKind::NotConnected,
             "missing streams for CONNECT tunnel",

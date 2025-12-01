@@ -1,15 +1,11 @@
 use std::sync::Arc;
 
 use tokio::net::TcpStream;
-use tokio_rustls::{
-    rustls::ServerConfig,
-    server::TlsStream as ServerTlsStream,
-    TlsAcceptor,
-};
+use tokio_rustls::{TlsAcceptor, rustls::ServerConfig, server::TlsStream as ServerTlsStream};
 
 use crate::{
-    connection::{Connection, ReadEnum, WriteEnum},
     config::CONFIG,
+    connection::{Connection, ReadEnum, WriteEnum},
     controller::ControllerMsg,
     fsm::NextStep,
     states::*,
@@ -76,12 +72,12 @@ pub async unsafe fn tls_handler(conn: &mut Connection, s: TlsState) -> NextStep 
 
                 match acceptor.accept(*tcp_box).await {
                     Ok(tls_stream) => {
-                    conn.client_tls = Some(Box::into_raw(Box::new(tls_stream)));
-                }
-                Err(e) => {
-                    println!("[TLS] Handshake error: {}", e);
-                    return NextStep::Close;
-                }
+                        conn.client_tls = Some(Box::into_raw(Box::new(tls_stream)));
+                    }
+                    Err(e) => {
+                        println!("[TLS] Handshake error: {}", e);
+                        return NextStep::Close;
+                    }
                 }
             } else if let Some(tls_ptr) = conn.client_tls.take() {
                 println!("[TLS] Handshake using existing client TLS (nested MITM inside CONNECT)");

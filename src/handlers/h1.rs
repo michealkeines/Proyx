@@ -1,18 +1,18 @@
+use http::{
+    Method, StatusCode, Uri, Version,
+    header::{self, HeaderMap, HeaderName, HeaderValue},
+};
 use httparse::{Request, Status};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc::error::TryRecvError;
 
 use crate::{
-    connection::Connection,
-    config::CONFIG,
-    controller::ControllerMsg,
-    fsm::NextStep,
-    states::*,
+    config::CONFIG, connection::Connection, controller::ControllerMsg, fsm::NextStep, states::*,
 };
 
 use super::shared::{
-    parse_connect_target, read_client_data, read_upstream_data, split_host_port, tunnel_copy, write_client_data,
-    write_upstream_data,
+    parse_connect_target, read_client_data, read_upstream_data, split_host_port, tunnel_copy,
+    write_client_data, write_upstream_data,
 };
 
 pub async unsafe fn h1_handler(conn: &mut Connection, s: H1State) -> NextStep {
@@ -81,11 +81,8 @@ pub async unsafe fn h1_handler(conn: &mut Connection, s: H1State) -> NextStep {
                 conn.upstream_tls_required = true;
                 if !conn.connect_response_sent {
                     println!("[H1] CONNECT sending 200 response to client (intercept mode)");
-                    let _ = write_client_data(
-                        conn,
-                        b"HTTP/1.1 200 Connection Established\r\n\r\n",
-                    )
-                    .await;
+                    let _ = write_client_data(conn, b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                        .await;
                     conn.connect_response_sent = true;
                 }
 
@@ -106,11 +103,8 @@ pub async unsafe fn h1_handler(conn: &mut Connection, s: H1State) -> NextStep {
 
             if !conn.connect_response_sent {
                 println!("[H1] CONNECT sending 200 response to client");
-                let _ = write_client_data(
-                    conn,
-                    b"HTTP/1.1 200 Connection Established\r\n\r\n",
-                )
-                .await;
+                let _ =
+                    write_client_data(conn, b"HTTP/1.1 200 Connection Established\r\n\r\n").await;
                 conn.connect_response_sent = true;
             }
 
@@ -126,9 +120,10 @@ pub async unsafe fn h1_handler(conn: &mut Connection, s: H1State) -> NextStep {
 
         H1State::Intercept(H1InterceptState::SendToController) => {
             if let Some(target) = conn.target() {
-                let _ = conn
-                    .controller_tx
-                    .send(ControllerMsg::Raw(format!("CONNECT {}:{}", target.host, target.port)));
+                let _ = conn.controller_tx.send(ControllerMsg::Raw(format!(
+                    "CONNECT {}:{}",
+                    target.host, target.port
+                )));
             } else {
                 let _ = conn
                     .controller_tx
@@ -160,11 +155,8 @@ pub async unsafe fn h1_handler(conn: &mut Connection, s: H1State) -> NextStep {
 
         H1State::Intercept(H1InterceptState::ApplyModification) => {
             if !conn.connect_response_sent {
-                let _ = write_client_data(
-                    conn,
-                    b"HTTP/1.1 200 Connection Established\r\n\r\n",
-                )
-                .await;
+                let _ =
+                    write_client_data(conn, b"HTTP/1.1 200 Connection Established\r\n\r\n").await;
                 conn.connect_response_sent = true;
             }
 
@@ -580,11 +572,11 @@ pub async unsafe fn h1_handler(conn: &mut Connection, s: H1State) -> NextStep {
                         conn.in_len = 0;
                     }
 
-                if from_upstream {
-                    return NextStep::Continue(ProxyState::H1(H1State::Lifecycle(
-                        H1ConnLifecycleState::CheckKeepAlive,
-                    )));
-                }
+                    if from_upstream {
+                        return NextStep::Continue(ProxyState::H1(H1State::Lifecycle(
+                            H1ConnLifecycleState::CheckKeepAlive,
+                        )));
+                    }
 
                     return NextStep::Continue(ProxyState::H1(H1State::Forward(
                         H1ForwardState::UpstreamRecvHeaders,
@@ -656,7 +648,9 @@ pub async unsafe fn h1_handler(conn: &mut Connection, s: H1State) -> NextStep {
             let n = conn.out_len;
 
             debug_assert!(
-                conn.client_mitm_tls.is_some() || conn.client_tls.is_some() || conn.client_tcp.is_some(),
+                conn.client_mitm_tls.is_some()
+                    || conn.client_tls.is_some()
+                    || conn.client_tcp.is_some(),
                 "[H1] SendResponseHeadersToClient needs a client stream"
             );
 
@@ -821,81 +815,189 @@ pub async unsafe fn h1_handler(conn: &mut Connection, s: H1State) -> NextStep {
 fn is_hop_by_hop(name: &str) -> bool {
     matches!(
         name.to_ascii_lowercase().as_str(),
-        "connection"
-            | "proxy-connection"
-            | "keep-alive"
-            | "te"
-            | "transfer-encoding"
-            | "upgrade"
+        "connection" | "proxy-connection" | "keep-alive" | "te" | "transfer-encoding" | "upgrade"
     )
+}
+
+fn header_map_from_httparse(raw: &[httparse::Header]) -> Result<HeaderMap, String> {
+    let mut map = HeaderMap::with_capacity(raw.len());
+    for h in raw.iter() {
+        let name = HeaderName::from_bytes(h.name.as_bytes())
+            .map_err(|e| format!("invalid header name '{}': {}", h.name, e))?;
+        let value = HeaderValue::from_bytes(h.value)
+            .map_err(|e| format!("invalid value for '{}': {}", h.name, e))?;
+        map.append(name, value);
+    }
+    Ok(map)
+}
+
+fn header_values_contains_token(headers: &HeaderMap, name: &HeaderName, token: &str) -> bool {
+    let needle = token.to_ascii_lowercase();
+    headers.get_all(name).iter().any(|value| {
+        value
+            .to_str()
+            .map(|v| {
+                v.split(',')
+                    .any(|part| part.trim().eq_ignore_ascii_case(&needle))
+            })
+            .unwrap_or(false)
+    })
+}
+
+fn header_values_contains_token_str(headers: &HeaderMap, name: &str, token: &str) -> bool {
+    let needle = token.to_ascii_lowercase();
+    headers.get_all(name).iter().any(|value| {
+        value
+            .to_str()
+            .map(|v| {
+                v.split(',')
+                    .any(|part| part.trim().eq_ignore_ascii_case(&needle))
+            })
+            .unwrap_or(false)
+    })
+}
+
+fn parse_content_length(headers: &HeaderMap) -> Option<u64> {
+    headers
+        .get(header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.trim().parse::<u64>().ok())
+}
+
+fn version_from_httparse(version: Option<u8>) -> Version {
+    match version {
+        Some(0) => Version::HTTP_10,
+        _ => Version::HTTP_11,
+    }
+}
+
+fn connection_header_value(keep_alive: bool) -> HeaderValue {
+    if keep_alive {
+        HeaderValue::from_static("keep-alive")
+    } else {
+        HeaderValue::from_static("close")
+    }
+}
+
+fn serialize_request(req: &http::Request<()>, request_target: &str) -> Result<Vec<u8>, String> {
+    let mut buf = Vec::with_capacity(512);
+    let target = if request_target.is_empty() {
+        "/"
+    } else {
+        request_target
+    };
+
+    buf.extend_from_slice(req.method().as_str().as_bytes());
+    buf.push(b' ');
+    buf.extend_from_slice(target.as_bytes());
+    buf.push(b' ');
+    buf.extend_from_slice(
+        match req.version() {
+            Version::HTTP_10 => "HTTP/1.0",
+            Version::HTTP_11 => "HTTP/1.1",
+            _ => "HTTP/1.1",
+        }
+        .as_bytes(),
+    );
+    buf.extend_from_slice(b"\r\n");
+
+    for (name, value) in req.headers() {
+        buf.extend_from_slice(name.as_str().as_bytes());
+        buf.extend_from_slice(b": ");
+        buf.extend_from_slice(value.as_bytes());
+        buf.extend_from_slice(b"\r\n");
+    }
+    buf.extend_from_slice(b"\r\n");
+
+    Ok(buf)
+}
+
+fn serialize_response(resp: &http::Response<()>, reason_phrase: &str) -> Result<Vec<u8>, String> {
+    let mut buf = Vec::with_capacity(512);
+    let version_str = match resp.version() {
+        Version::HTTP_10 => "HTTP/1.0",
+        Version::HTTP_11 => "HTTP/1.1",
+        _ => "HTTP/1.1",
+    };
+
+    let status = resp.status();
+    let reason = if reason_phrase.is_empty() {
+        status.canonical_reason().unwrap_or("")
+    } else {
+        reason_phrase
+    };
+
+    buf.extend_from_slice(version_str.as_bytes());
+    buf.push(b' ');
+    buf.extend_from_slice(status.as_str().as_bytes());
+    buf.push(b' ');
+    buf.extend_from_slice(reason.as_bytes());
+    buf.extend_from_slice(b"\r\n");
+
+    for (name, value) in resp.headers() {
+        buf.extend_from_slice(name.as_str().as_bytes());
+        buf.extend_from_slice(b": ");
+        buf.extend_from_slice(value.as_bytes());
+        buf.extend_from_slice(b"\r\n");
+    }
+    buf.extend_from_slice(b"\r\n");
+
+    Ok(buf)
 }
 
 fn prepare_h1_request(conn: &mut Connection, header_bytes: &[u8]) -> Result<(), String> {
     let mut headers = [httparse::EMPTY_HEADER; 64];
     let mut req = Request::new(&mut headers);
-    let status = req.parse(header_bytes).map_err(|e| format!("parse error: {}", e))?;
+    let status = req
+        .parse(header_bytes)
+        .map_err(|e| format!("parse error: {}", e))?;
     if !matches!(status, Status::Complete(_)) {
         return Err("incomplete request headers".into());
     }
 
-    let method = req.method.ok_or("missing method")?.to_string();
-    let path = req.path.ok_or("missing path")?.to_string();
-    let version = req.version.unwrap_or(1);
-    let is_1_0 = version == 0;
+    let method_str = req.method.ok_or("missing method")?;
+    let path = req.path.ok_or("missing path")?;
+    let method =
+        Method::from_bytes(method_str.as_bytes()).map_err(|e| format!("invalid method: {}", e))?;
+    let version = version_from_httparse(req.version);
+    let is_1_0 = version == Version::HTTP_10;
+
+    let header_map = header_map_from_httparse(req.headers)?;
+    let host_header = header_map
+        .get(header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
 
     let mut keep_alive = !is_1_0;
-    let mut is_chunked = false;
-    let mut content_len: Option<u64> = None;
-    let mut expect_continue = false;
-    let mut host_header: Option<String> = None;
-
-    for h in req.headers.iter() {
-        let name = h.name.to_ascii_lowercase();
-        let value = std::str::from_utf8(h.value).unwrap_or("").trim();
-
-        match name.as_str() {
-            "host" => host_header = Some(value.to_string()),
-            "connection" => {
-                let lower = value.to_ascii_lowercase();
-                if lower.contains("close") {
-                    keep_alive = false;
-                }
-                if lower.contains("keep-alive") && is_1_0 {
-                    keep_alive = true;
-                }
-            }
-            "proxy-connection" => keep_alive = false,
-            "expect" => {
-                if value.eq_ignore_ascii_case("100-continue") {
-                    expect_continue = true;
-                }
-            }
-            "transfer-encoding" => {
-                if value.to_ascii_lowercase().contains("chunked") {
-                    is_chunked = true;
-                }
-            }
-            "content-length" => {
-                if let Ok(v) = value.parse::<u64>() {
-                    content_len = Some(v);
-                }
-            }
-            _ => {}
-        }
+    if header_values_contains_token(&header_map, &header::CONNECTION, "close") {
+        keep_alive = false;
     }
+    if is_1_0 && header_values_contains_token(&header_map, &header::CONNECTION, "keep-alive") {
+        keep_alive = true;
+    }
+    if header_map.contains_key("proxy-connection")
+        || header_values_contains_token_str(&header_map, "proxy-connection", "close")
+    {
+        keep_alive = false;
+    }
+
+    let mut is_chunked =
+        header_values_contains_token(&header_map, &header::TRANSFER_ENCODING, "chunked");
+    let mut content_len = parse_content_length(&header_map);
+    let expect_continue =
+        header_values_contains_token(&header_map, &header::EXPECT, "100-continue");
 
     if is_chunked {
         content_len = None;
     }
 
-    let method_upper = method.to_ascii_uppercase();
-    let is_connect = method_upper == "CONNECT";
-    let is_head = method_upper == "HEAD";
+    let is_connect = method == Method::CONNECT;
+    let is_head = method == Method::HEAD;
 
     let mut target_host = String::new();
     let mut target_port: u16 = 80;
-    let mut upstream_path = path.clone();
-    let mut default_port = 80;
+    let mut upstream_path = path.to_string();
+    let mut default_port = 80u16;
 
     if is_connect {
         let (h, p) = split_host_port(&path, 443);
@@ -908,26 +1010,32 @@ fn prepare_h1_request(conn: &mut Connection, header_bytes: &[u8]) -> Result<(), 
             H1ConnectState::ConnectTunnelTransfer,
         )));
     } else if path.starts_with("http://") || path.starts_with("https://") {
-        let (scheme, rest) = path
-            .split_once("://")
-            .ok_or("invalid absolute-form request-target")?;
+        let uri: Uri = path
+            .parse()
+            .map_err(|_| "invalid absolute-form request-target".to_string())?;
+        let scheme = uri
+            .scheme_str()
+            .ok_or_else(|| "absolute-form request missing scheme".to_string())?;
         default_port = if scheme.eq_ignore_ascii_case("https") {
             443
         } else {
             80
         };
-        let slash = rest.find('/').unwrap_or(rest.len());
-        let authority = &rest[..slash];
-        let parsed_path = if slash < rest.len() {
-            &rest[slash..]
-        } else {
-            "/"
-        };
-        let (h, p) = split_host_port(authority, default_port);
+        let authority = uri
+            .authority()
+            .map(|a| a.as_str().to_string())
+            .ok_or_else(|| "absolute-form request missing authority".to_string())?;
+        let (h, p) = split_host_port(&authority, default_port);
         target_host = h;
         target_port = p;
-        upstream_path = parsed_path.to_string();
+        upstream_path = uri
+            .path_and_query()
+            .map(|pq| pq.as_str().to_string())
+            .unwrap_or_else(|| "/".to_string());
         conn.upstream_tls_required = default_port == 443;
+        conn.next_state_after_upstream = Some(ProxyState::H1(H1State::Forward(
+            H1ForwardState::ForwardRequestHeaders,
+        )));
     } else {
         let (h, p) = match host_header {
             Some(ref host) => split_host_port(host, 80),
@@ -945,6 +1053,9 @@ fn prepare_h1_request(conn: &mut Connection, header_bytes: &[u8]) -> Result<(), 
         target_port = p;
         default_port = if target_port == 443 { 443 } else { 80 };
         conn.upstream_tls_required = target_port == 443;
+        conn.next_state_after_upstream = Some(ProxyState::H1(H1State::Forward(
+            H1ForwardState::ForwardRequestHeaders,
+        )));
     }
 
     if target_host.is_empty() {
@@ -952,81 +1063,80 @@ fn prepare_h1_request(conn: &mut Connection, header_bytes: &[u8]) -> Result<(), 
     }
 
     conn.set_target(target_host.clone(), target_port);
-    if is_connect {
-        conn.next_state_after_upstream = Some(ProxyState::H1(H1State::Connect(
-            H1ConnectState::ConnectTunnelTransfer,
-        )));
+
+    let mut builder = http::Request::builder().method(&method).version(version);
+    let uri = if is_connect {
+        Uri::from_static("/")
     } else {
-        conn.next_state_after_upstream = Some(ProxyState::H1(H1State::Forward(
-            H1ForwardState::ForwardRequestHeaders,
-        )));
-    }
+        upstream_path
+            .parse::<Uri>()
+            .map_err(|e| format!("invalid path: {}", e))?
+    };
+    builder = builder.uri(uri);
 
-    let mut rewritten = Vec::with_capacity(header_bytes.len() + 32);
-    let version_str = if is_1_0 { "HTTP/1.0" } else { "HTTP/1.1" };
-    rewritten.extend_from_slice(method.as_bytes());
-    rewritten.push(b' ');
-    rewritten.extend_from_slice(upstream_path.as_bytes());
-    rewritten.push(b' ');
-    rewritten.extend_from_slice(version_str.as_bytes());
-    rewritten.extend_from_slice(b"\r\n");
+    {
+        let headers = builder
+            .headers_mut()
+            .ok_or_else(|| "failed to access request headers".to_string())?;
 
-    for h in req.headers.iter() {
-        let name = h.name;
-        let lower = name.to_ascii_lowercase();
-        if is_hop_by_hop(&lower) {
-            continue;
+        for (name, value) in header_map.iter() {
+            let lower = name.as_str();
+            if is_hop_by_hop(lower)
+                || name == header::HOST
+                || name == header::CONTENT_LENGTH
+                || name == header::TRANSFER_ENCODING
+                || name == header::EXPECT
+            {
+                continue;
+            }
+            headers.append(name.clone(), value.clone());
         }
-        if lower == "host"
-            || lower == "content-length"
-            || lower == "transfer-encoding"
-            || lower == "expect"
-        {
-            continue;
+
+        if !is_connect {
+            let include_port = target_port != default_port;
+            let host_value = if include_port {
+                format!("{}:{}", target_host, target_port)
+            } else {
+                target_host.clone()
+            };
+            headers.insert(
+                header::HOST,
+                HeaderValue::from_str(&host_value)
+                    .map_err(|e| format!("invalid host header: {}", e))?,
+            );
         }
-        rewritten.extend_from_slice(name.as_bytes());
-        rewritten.extend_from_slice(b": ");
-        rewritten.extend_from_slice(h.value);
-        rewritten.extend_from_slice(b"\r\n");
-    }
 
-    if !is_connect {
-        let include_port = target_port != default_port;
-        rewritten.extend_from_slice(b"Host: ");
-        rewritten.extend_from_slice(target_host.as_bytes());
-        if include_port {
-            rewritten.extend_from_slice(format!(":{}", target_port).as_bytes());
+        headers.insert(header::CONNECTION, connection_header_value(keep_alive));
+        if expect_continue {
+            headers.insert(header::EXPECT, HeaderValue::from_static("100-continue"));
         }
-        rewritten.extend_from_slice(b"\r\n");
+        if is_chunked {
+            headers.insert(
+                header::TRANSFER_ENCODING,
+                HeaderValue::from_static("chunked"),
+            );
+        } else if let Some(len) = content_len {
+            headers.insert(
+                header::CONTENT_LENGTH,
+                HeaderValue::from_str(&len.to_string())
+                    .map_err(|e| format!("invalid content-length: {}", e))?,
+            );
+        }
     }
 
-    let conn_header = if keep_alive { "keep-alive" } else { "close" };
-    rewritten.extend_from_slice(b"Connection: ");
-    rewritten.extend_from_slice(conn_header.as_bytes());
-    rewritten.extend_from_slice(b"\r\n");
+    let request = builder
+        .body(())
+        .map_err(|e| format!("failed to build request: {}", e))?;
 
-    if expect_continue {
-        rewritten.extend_from_slice(b"Expect: 100-continue\r\n");
-    }
-
-    if is_chunked {
-        rewritten.extend_from_slice(b"Transfer-Encoding: chunked\r\n");
-    } else if let Some(len) = content_len {
-        rewritten.extend_from_slice(format!("Content-Length: {}\r\n", len).as_bytes());
-    }
-
-    rewritten.extend_from_slice(b"\r\n");
+    let request_target = upstream_path.clone();
+    let rewritten = serialize_request(&request, &request_target)?;
 
     if rewritten.len() > conn.out_cap {
         return Err("request headers exceed buffer".into());
     }
 
     unsafe {
-        std::ptr::copy_nonoverlapping(
-            rewritten.as_ptr(),
-            conn.out_buf.as_ptr(),
-            rewritten.len(),
-        );
+        std::ptr::copy_nonoverlapping(rewritten.as_ptr(), conn.out_buf.as_ptr(), rewritten.len());
     }
     conn.out_len = rewritten.len();
 
@@ -1047,56 +1157,50 @@ fn prepare_h1_request(conn: &mut Connection, header_bytes: &[u8]) -> Result<(), 
 fn prepare_h1_response(conn: &mut Connection, header_bytes: &[u8]) -> Result<(), String> {
     let mut headers = [httparse::EMPTY_HEADER; 64];
     let mut resp = httparse::Response::new(&mut headers);
-    let status = resp.parse(header_bytes).map_err(|e| format!("parse error: {}", e))?;
+    let status = resp
+        .parse(header_bytes)
+        .map_err(|e| format!("parse error: {}", e))?;
     if !matches!(status, Status::Complete(_)) {
         return Err("incomplete response headers".into());
     }
 
-    let version = resp.version.unwrap_or(1);
-    let status_code = resp.code.ok_or("missing status code")?;
-    let reason = resp.reason.unwrap_or("OK");
-    let mut keep_alive = !matches!(version, 0);
-    let mut is_chunked = false;
-    let mut content_len: Option<u64> = None;
+    let version = version_from_httparse(resp.version);
+    let status_code = StatusCode::from_u16(resp.code.ok_or("missing status code")?)
+        .map_err(|e| format!("invalid status code: {}", e))?;
+    let reason = resp
+        .reason
+        .map(|r| r.to_string())
+        .unwrap_or_else(|| status_code.canonical_reason().unwrap_or("OK").to_string());
+    let mut keep_alive = version != Version::HTTP_10;
 
-    for h in resp.headers.iter() {
-        let name = h.name.to_ascii_lowercase();
-        let value = std::str::from_utf8(h.value).unwrap_or("").trim();
-
-        match name.as_str() {
-            "connection" => {
-                let lower = value.to_ascii_lowercase();
-                if lower.contains("close") {
-                    keep_alive = false;
-                }
-                if lower.contains("keep-alive") && version == 0 {
-                    keep_alive = true;
-                }
-            }
-            "proxy-connection" => keep_alive = false,
-            "transfer-encoding" => {
-                if value.to_ascii_lowercase().contains("chunked") {
-                    is_chunked = true;
-                }
-            }
-            "content-length" => {
-                if let Ok(v) = value.parse::<u64>() {
-                    content_len = Some(v);
-                }
-            }
-            _ => {}
-        }
+    let header_map = header_map_from_httparse(resp.headers)?;
+    if header_values_contains_token(&header_map, &header::CONNECTION, "close") {
+        keep_alive = false;
     }
+    if version == Version::HTTP_10
+        && header_values_contains_token(&header_map, &header::CONNECTION, "keep-alive")
+    {
+        keep_alive = true;
+    }
+    if header_map.contains_key("proxy-connection")
+        || header_values_contains_token_str(&header_map, "proxy-connection", "close")
+    {
+        keep_alive = false;
+    }
+
+    let mut is_chunked =
+        header_values_contains_token(&header_map, &header::TRANSFER_ENCODING, "chunked");
+    let mut content_len = parse_content_length(&header_map);
 
     if is_chunked {
         content_len = None;
     }
 
     let mut has_body = true;
-    if (100..200).contains(&status_code) && status_code != 101 {
+    if (100..200).contains(&status_code.as_u16()) && status_code.as_u16() != 101 {
         has_body = false;
     }
-    if status_code == 204 || status_code == 304 {
+    if status_code == StatusCode::NO_CONTENT || status_code == StatusCode::NOT_MODIFIED {
         has_body = false;
     }
     if conn.client_h1_state.is_head || conn.client_h1_state.is_connect {
@@ -1108,56 +1212,55 @@ fn prepare_h1_response(conn: &mut Connection, header_bytes: &[u8]) -> Result<(),
         is_chunked = false;
     }
 
-    let mut rewritten = Vec::with_capacity(header_bytes.len() + 32);
-    let version_str = if version == 0 { "HTTP/1.0" } else { "HTTP/1.1" };
-    rewritten.extend_from_slice(version_str.as_bytes());
-    rewritten.push(b' ');
-    rewritten.extend_from_slice(status_code.to_string().as_bytes());
-    rewritten.push(b' ');
-    rewritten.extend_from_slice(reason.as_bytes());
-    rewritten.extend_from_slice(b"\r\n");
+    let mut builder = http::Response::builder()
+        .status(status_code)
+        .version(version);
 
-    for h in resp.headers.iter() {
-        let name = h.name;
-        let lower = name.to_ascii_lowercase();
-        if is_hop_by_hop(&lower) {
-            continue;
-        }
-        if lower == "content-length" || lower == "transfer-encoding" {
-            continue;
+    {
+        let headers_mut = builder
+            .headers_mut()
+            .ok_or_else(|| "failed to access response headers".to_string())?;
+
+        for (name, value) in header_map.iter() {
+            let lower = name.as_str();
+            if is_hop_by_hop(lower)
+                || name == header::CONTENT_LENGTH
+                || name == header::TRANSFER_ENCODING
+            {
+                continue;
+            }
+            headers_mut.append(name.clone(), value.clone());
         }
 
-        rewritten.extend_from_slice(name.as_bytes());
-        rewritten.extend_from_slice(b": ");
-        rewritten.extend_from_slice(h.value);
-        rewritten.extend_from_slice(b"\r\n");
+        headers_mut.insert(header::CONNECTION, connection_header_value(keep_alive));
+
+        if has_body {
+            if is_chunked {
+                headers_mut.insert(
+                    header::TRANSFER_ENCODING,
+                    HeaderValue::from_static("chunked"),
+                );
+            } else if let Some(len) = content_len {
+                headers_mut.insert(
+                    header::CONTENT_LENGTH,
+                    HeaderValue::from_str(&len.to_string())
+                        .map_err(|e| format!("invalid content-length: {}", e))?,
+                );
+            }
+        }
     }
 
-    let conn_header = if keep_alive { "keep-alive" } else { "close" };
-    rewritten.extend_from_slice(b"Connection: ");
-    rewritten.extend_from_slice(conn_header.as_bytes());
-    rewritten.extend_from_slice(b"\r\n");
-
-    if has_body {
-        if is_chunked {
-            rewritten.extend_from_slice(b"Transfer-Encoding: chunked\r\n");
-        } else if let Some(len) = content_len {
-            rewritten.extend_from_slice(format!("Content-Length: {}\r\n", len).as_bytes());
-        }
-    }
-
-    rewritten.extend_from_slice(b"\r\n");
+    let response = builder
+        .body(())
+        .map_err(|e| format!("failed to build response: {}", e))?;
+    let rewritten = serialize_response(&response, &reason)?;
 
     if rewritten.len() > conn.out_cap {
         return Err("response headers exceed buffer".into());
     }
 
     unsafe {
-        std::ptr::copy_nonoverlapping(
-            rewritten.as_ptr(),
-            conn.out_buf.as_ptr(),
-            rewritten.len(),
-        );
+        std::ptr::copy_nonoverlapping(rewritten.as_ptr(), conn.out_buf.as_ptr(), rewritten.len());
     }
     conn.out_len = rewritten.len();
 
@@ -1167,7 +1270,7 @@ fn prepare_h1_response(conn: &mut Connection, header_bytes: &[u8]) -> Result<(),
     conn.upstream_h1_state.is_chunked = is_chunked;
     conn.upstream_h1_state.content_len = content_len;
     conn.upstream_h1_state.body_len = if is_chunked { Some(0) } else { content_len };
-    conn.upstream_h1_state.version_1_0 = version == 0;
+    conn.upstream_h1_state.version_1_0 = version == Version::HTTP_10;
 
     Ok(())
 }

@@ -2,7 +2,13 @@ use std::io::ErrorKind;
 
 use hpack::{Decoder, Encoder};
 
-use crate::{config::CONFIG, connection::Connection, fsm::NextStep, states::*};
+use crate::{
+    config::CONFIG,
+    connection::Connection,
+    fsm::NextStep,
+    protocols::h2::frame::{Error, Head, Kind, Settings},
+    states::*,
+};
 
 use super::shared::{
     read_client_data, read_upstream_data, split_host_port, write_client_data, write_upstream_data,
@@ -97,11 +103,11 @@ pub async unsafe fn h2_handler(conn: &mut Connection, s: H2State) -> NextStep {
             let settings_len = header.length;
             let total = 9 + settings_len;
 
-            if header.kind != 0x4 {
+            if header.kind() != Kind::Settings {
                 return h2_connection_error(conn, 0x1, "first frame was not SETTINGS").await;
             }
 
-            if header.flags & 0x1 != 0 {
+            if header.flags() & 0x1 != 0 {
                 if settings_len != 0 {
                     return h2_connection_error(conn, 0x6, "SETTINGS ack had non-zero length")
                         .await;
@@ -150,7 +156,14 @@ pub async unsafe fn h2_handler(conn: &mut Connection, s: H2State) -> NextStep {
                     .extend_from_slice(&buf[..total]);
             }
             if settings_len > 0 {
-                apply_h2_settings(&mut conn.h2_client_max_frame_size, &buf[9..total]);
+                if let Err(e) = apply_h2_settings(
+                    header.head(),
+                    &mut conn.h2_client_max_frame_size,
+                    &buf[9..total],
+                ) {
+                    println!("[H2] Invalid SETTINGS from client: {:?}", e);
+                    return h2_connection_error(conn, 0x1, "invalid SETTINGS frame").await;
+                }
             }
 
             let settings_ack = build_h2_frame_header(0, 0x4, 0x1, 0);
@@ -194,10 +207,13 @@ pub async unsafe fn h2_handler(conn: &mut Connection, s: H2State) -> NextStep {
             let frame = parse_h2_frame_header(&buf[..9]);
             println!(
                 "[H2] Frame parsed len={} type={} flags=0x{:02x} stream={}",
-                frame.length, frame.kind, frame.flags, frame.stream_id
+                frame.length,
+                frame.kind() as u8,
+                frame.flags(),
+                frame.stream_id()
             );
 
-            conn.scratch = ((frame.stream_id as u64) << 32) | frame.length as u64;
+            conn.scratch = ((frame.stream_id() as u64) << 32) | frame.length as u64;
 
             return NextStep::Continue(ProxyState::H2(H2State::FlowControl(
                 H2FlowControlState::FlowControlWaitWindowUpdate,
@@ -242,10 +258,11 @@ pub async unsafe fn h2_handler(conn: &mut Connection, s: H2State) -> NextStep {
             let total = 9 + payload_len;
 
             if let Some(connect_stream) = conn.h2_connect_stream_id {
-                if frame.stream_id == connect_stream && frame.kind == 0x0 {
+                if frame.stream_id() == connect_stream && frame.kind() == Kind::Data {
                     println!(
                         "[H2] CONNECT deferring DATA frame (len={} flags=0x{:02x}) to tunnel handler",
-                        frame.length, frame.flags
+                        frame.length,
+                        frame.flags()
                     );
                     return NextStep::Continue(ProxyState::H2(H2State::Proxy(
                         H2ProxyState::ProxyFramesClientToUpstream,
@@ -253,8 +270,8 @@ pub async unsafe fn h2_handler(conn: &mut Connection, s: H2State) -> NextStep {
                 }
             }
 
-            if frame.kind == 0x4 {
-                if frame.flags & 0x1 != 0 {
+            if frame.kind() == Kind::Settings {
+                if frame.flags() & 0x1 != 0 {
                     println!("[H2] Received SETTINGS ACK from client");
                     consume_h2_frame(conn, buf, total);
                     return NextStep::Continue(ProxyState::H2(H2State::FrameParse(
@@ -267,7 +284,14 @@ pub async unsafe fn h2_handler(conn: &mut Connection, s: H2State) -> NextStep {
                         .await;
                 }
 
-                apply_h2_settings(&mut conn.h2_client_max_frame_size, &buf[9..total]);
+                if let Err(e) = apply_h2_settings(
+                    frame.head(),
+                    &mut conn.h2_client_max_frame_size,
+                    &buf[9..total],
+                ) {
+                    println!("[H2] Invalid SETTINGS from client: {:?}", e);
+                    return h2_connection_error(conn, 0x1, "invalid SETTINGS frame").await;
+                }
 
                 let settings_ack = build_h2_frame_header(0, 0x4, 0x1, 0);
                 if let Err(e) = write_client_data(conn, &settings_ack).await {
@@ -281,7 +305,7 @@ pub async unsafe fn h2_handler(conn: &mut Connection, s: H2State) -> NextStep {
                 )));
             }
 
-            if frame.kind == 0x1 && frame.stream_id != 0 {
+            if frame.kind() == Kind::Headers && frame.stream_id() != 0 {
                 let (frag, consumed_total) =
                     match h2_read_headers_block(conn, buf, &frame, true).await {
                         Ok(v) => v,
@@ -299,8 +323,8 @@ pub async unsafe fn h2_handler(conn: &mut Connection, s: H2State) -> NextStep {
                     let frames = encode_h2_headers_for_peer(
                         &mut conn.h2_upstream_encoder,
                         &headers,
-                        frame.stream_id,
-                        frame.flags & 0x1 != 0,
+                        frame.stream_id(),
+                        frame.flags() & 0x1 != 0,
                         conn.h2_upstream_max_frame_size,
                     );
                     conn.h2_pending_upstream_frames.extend_from_slice(&frames);
@@ -321,13 +345,13 @@ pub async unsafe fn h2_handler(conn: &mut Connection, s: H2State) -> NextStep {
                 consume_h2_frame(conn, buf, consumed_total);
 
                 if method.eq_ignore_ascii_case("CONNECT") {
-                    println!("[H2] CONNECT detected on stream {}", frame.stream_id);
+                    println!("[H2] CONNECT detected on stream {}", frame.stream_id());
                     conn.h2_use_upstream_h2 = false;
                     conn.h2_pending_upstream_frames.clear();
                     conn.set_target(host, port);
                     conn.upstream_tls_required = false;
                     conn.connect_response_sent = false;
-                    conn.h2_connect_stream_id = Some(frame.stream_id);
+                    conn.h2_connect_stream_id = Some(frame.stream_id());
                     conn.next_state_after_upstream = Some(ProxyState::H2(H2State::Proxy(
                         H2ProxyState::ProxyFramesClientToUpstream,
                     )));
@@ -352,7 +376,7 @@ pub async unsafe fn h2_handler(conn: &mut Connection, s: H2State) -> NextStep {
                     .extend_from_slice(&buf[..total]);
             }
 
-            if frame.kind != 0x1 && conn.target().is_none() {
+            if frame.kind() != Kind::Headers && conn.target().is_none() {
                 consume_h2_frame(conn, buf, total);
                 return NextStep::Continue(ProxyState::H2(H2State::FrameParse(
                     H2FrameParseState::RecvFrameHeader,
@@ -432,7 +456,7 @@ pub async unsafe fn h2_handler(conn: &mut Connection, s: H2State) -> NextStep {
             }
 
             let header = parse_h2_frame_header(&buf[..9]);
-            if header.kind != 0x4 || (header.flags & 0x1 != 0) {
+            if header.kind() != Kind::Settings || (header.flags() & 0x1 != 0) {
                 return h2_connection_error(conn, 0x1, "upstream did not start with SETTINGS")
                     .await;
             }
@@ -457,7 +481,14 @@ pub async unsafe fn h2_handler(conn: &mut Connection, s: H2State) -> NextStep {
                 }
             }
 
-            apply_h2_settings(&mut conn.h2_upstream_max_frame_size, &buf[9..total]);
+            if let Err(e) = apply_h2_settings(
+                header.head(),
+                &mut conn.h2_upstream_max_frame_size,
+                &buf[9..total],
+            ) {
+                println!("[H2] Invalid upstream SETTINGS: {:?}", e);
+                return h2_connection_error(conn, 0x1, "invalid SETTINGS frame").await;
+            }
 
             let ack = build_h2_frame_header(0, 0x4, 0x1, 0);
             if let Err(e) = write_upstream_data(conn, &ack).await {
@@ -618,19 +649,20 @@ pub async unsafe fn h2_handler(conn: &mut Connection, s: H2State) -> NextStep {
                     }
                 }
 
-                if frame.stream_id == 0 {
-                    match frame.kind {
-                        0x4 => {
+                if frame.stream_id() == 0 {
+                    match frame.kind() {
+                        Kind::Settings => {
                             println!(
                                 "[H2] CONNECT received connection-level SETTINGS (flags=0x{:02x}, len={}), ignoring",
-                                frame.flags, frame.length
+                                frame.flags(),
+                                frame.length
                             );
                             consume_h2_frame(conn, buf, total);
                             return NextStep::Continue(ProxyState::H2(H2State::FrameParse(
                                 H2FrameParseState::RecvFrameHeader,
                             )));
                         }
-                        0x6 => {
+                        Kind::Ping => {
                             if frame.length != 8 {
                                 println!(
                                     "[H2] CONNECT received invalid PING length {}, dropping",
@@ -642,7 +674,7 @@ pub async unsafe fn h2_handler(conn: &mut Connection, s: H2State) -> NextStep {
                                 )));
                             }
 
-                            if frame.flags & 0x1 == 0 {
+                            if frame.flags() & 0x1 == 0 {
                                 let mut ack = Vec::with_capacity(17);
                                 ack.extend_from_slice(&build_h2_frame_header(8, 0x6, 0x1, 0));
                                 ack.extend_from_slice(&buf[9..17]);
@@ -658,20 +690,21 @@ pub async unsafe fn h2_handler(conn: &mut Connection, s: H2State) -> NextStep {
                                 H2FrameParseState::RecvFrameHeader,
                             )));
                         }
-                        0x8 => {
+                        Kind::WindowUpdate => {
                             println!(
                                 "[H2] CONNECT received WINDOW_UPDATE (len={} stream={}), ignoring",
-                                frame.length, frame.stream_id
+                                frame.length,
+                                frame.stream_id()
                             );
                             consume_h2_frame(conn, buf, total);
                             return NextStep::Continue(ProxyState::H2(H2State::FrameParse(
                                 H2FrameParseState::RecvFrameHeader,
                             )));
                         }
-                        _ => {
+                        other => {
                             println!(
                                 "[H2] CONNECT ignoring connection-level frame kind={} len={}",
-                                frame.kind, frame.length
+                                other as u8, frame.length
                             );
                             consume_h2_frame(conn, buf, total);
                             return NextStep::Continue(ProxyState::H2(H2State::FrameParse(
@@ -681,10 +714,12 @@ pub async unsafe fn h2_handler(conn: &mut Connection, s: H2State) -> NextStep {
                     }
                 }
 
-                if frame.stream_id != stream_id {
+                if frame.stream_id() != stream_id {
                     println!(
                         "[H2] CONNECT ignoring frame on stream {} (kind={}) while tunneling stream {}",
-                        frame.stream_id, frame.kind, stream_id
+                        frame.stream_id(),
+                        frame.kind() as u8,
+                        stream_id
                     );
                     consume_h2_frame(conn, buf, total);
                     return NextStep::Continue(ProxyState::H2(H2State::FrameParse(
@@ -692,10 +727,12 @@ pub async unsafe fn h2_handler(conn: &mut Connection, s: H2State) -> NextStep {
                     )));
                 }
 
-                if frame.kind != 0x0 {
+                if frame.kind() != Kind::Data {
                     println!(
                         "[H2] CONNECT expected DATA on stream {}, got kind={} (flags=0x{:02x})",
-                        stream_id, frame.kind, frame.flags
+                        stream_id,
+                        frame.kind() as u8,
+                        frame.flags()
                     );
                     consume_h2_frame(conn, buf, total);
                     return NextStep::Continue(ProxyState::H2(H2State::FrameParse(
@@ -706,7 +743,7 @@ pub async unsafe fn h2_handler(conn: &mut Connection, s: H2State) -> NextStep {
                 let mut offset = 9;
                 let mut remaining = frame.length;
                 let mut pad_len = 0usize;
-                if frame.flags & 0x8 != 0 {
+                if frame.flags() & 0x8 != 0 {
                     if remaining == 0 {
                         println!("[H2] CONNECT DATA PADDED but no pad length byte");
                         conn.in_len = 0;
@@ -729,11 +766,11 @@ pub async unsafe fn h2_handler(conn: &mut Connection, s: H2State) -> NextStep {
                 let data_len = remaining - pad_len;
                 println!(
                     "[H2] CONNECT DATA frame stream={} len={} data={} pad={} end_stream={}",
-                    frame.stream_id,
+                    frame.stream_id(),
                     frame.length,
                     data_len,
                     pad_len,
-                    frame.flags & 0x1 != 0
+                    frame.flags() & 0x1 != 0
                 );
 
                 if data_len > 0 {
@@ -806,14 +843,21 @@ pub async unsafe fn h2_handler(conn: &mut Connection, s: H2State) -> NextStep {
                     }
                 }
 
-                if frame.kind == 0x4 {
-                    if frame.flags & 0x1 != 0 {
+                if frame.kind() == Kind::Settings {
+                    if frame.flags() & 0x1 != 0 {
                         println!("[H2] Dropping client SETTINGS ACK");
                         consume_h2_frame(conn, buf, total);
                         continue;
                     }
 
-                    apply_h2_settings(&mut conn.h2_client_max_frame_size, &buf[9..total]);
+                    if let Err(e) = apply_h2_settings(
+                        frame.head(),
+                        &mut conn.h2_client_max_frame_size,
+                        &buf[9..total],
+                    ) {
+                        println!("[H2] Invalid client SETTINGS: {:?}", e);
+                        return h2_connection_error(conn, 0x1, "invalid SETTINGS frame").await;
+                    }
                     let ack = build_h2_frame_header(0, 0x4, 0x1, 0);
                     if let Err(e) = write_client_data(conn, &ack).await {
                         println!("[H2] Failed to ACK client SETTINGS: {}", e);
@@ -823,7 +867,7 @@ pub async unsafe fn h2_handler(conn: &mut Connection, s: H2State) -> NextStep {
                     continue;
                 }
 
-                if frame.kind == 0x1 {
+                if frame.kind() == Kind::Headers {
                     let (block, consumed) =
                         match h2_read_headers_block(conn, buf, &frame, true).await {
                             Ok(v) => v,
@@ -840,8 +884,8 @@ pub async unsafe fn h2_handler(conn: &mut Connection, s: H2State) -> NextStep {
                     let encoded = encode_h2_headers_for_peer(
                         &mut conn.h2_upstream_encoder,
                         &headers,
-                        frame.stream_id,
-                        frame.flags & 0x1 != 0,
+                        frame.stream_id(),
+                        frame.flags() & 0x1 != 0,
                         conn.h2_upstream_max_frame_size,
                     );
 
@@ -853,7 +897,9 @@ pub async unsafe fn h2_handler(conn: &mut Connection, s: H2State) -> NextStep {
                     forwarded = true;
                     consume_h2_frame(conn, buf, consumed);
                 } else {
-                    if frame.length > conn.h2_upstream_max_frame_size && frame.kind != 0x4 {
+                    if frame.length > conn.h2_upstream_max_frame_size
+                        && frame.kind() != Kind::Settings
+                    {
                         return h2_connection_error(
                             conn,
                             0x6,
@@ -931,14 +977,21 @@ pub async unsafe fn h2_handler(conn: &mut Connection, s: H2State) -> NextStep {
                     }
                 }
 
-                if frame.kind == 0x4 {
-                    if frame.flags & 0x1 != 0 {
+                if frame.kind() == Kind::Settings {
+                    if frame.flags() & 0x1 != 0 {
                         println!("[H2] Dropping upstream SETTINGS ACK");
                         consume_h2_frame(conn, buf, total);
                         continue;
                     }
 
-                    apply_h2_settings(&mut conn.h2_upstream_max_frame_size, &buf[9..total]);
+                    if let Err(e) = apply_h2_settings(
+                        frame.head(),
+                        &mut conn.h2_upstream_max_frame_size,
+                        &buf[9..total],
+                    ) {
+                        println!("[H2] Invalid upstream SETTINGS: {:?}", e);
+                        return h2_connection_error(conn, 0x1, "invalid SETTINGS frame").await;
+                    }
                     let ack = build_h2_frame_header(0, 0x4, 0x1, 0);
                     if let Err(e) = write_upstream_data(conn, &ack).await {
                         println!("[H2] Failed to ack upstream SETTINGS: {}", e);
@@ -948,7 +1001,7 @@ pub async unsafe fn h2_handler(conn: &mut Connection, s: H2State) -> NextStep {
                     continue;
                 }
 
-                if frame.kind == 0x1 {
+                if frame.kind() == Kind::Headers {
                     let (block, consumed) =
                         match h2_read_headers_block(conn, buf, &frame, false).await {
                             Ok(v) => v,
@@ -970,8 +1023,8 @@ pub async unsafe fn h2_handler(conn: &mut Connection, s: H2State) -> NextStep {
                     let encoded = encode_h2_headers_for_peer(
                         &mut conn.h2_client_encoder,
                         &headers,
-                        frame.stream_id,
-                        frame.flags & 0x1 != 0,
+                        frame.stream_id(),
+                        frame.flags() & 0x1 != 0,
                         conn.h2_client_max_frame_size,
                     );
 
@@ -983,7 +1036,9 @@ pub async unsafe fn h2_handler(conn: &mut Connection, s: H2State) -> NextStep {
                     forwarded = true;
                     consume_h2_frame(conn, buf, consumed);
                 } else {
-                    if frame.length > conn.h2_client_max_frame_size && frame.kind != 0x4 {
+                    if frame.length > conn.h2_client_max_frame_size
+                        && frame.kind() != Kind::Settings
+                    {
                         return h2_connection_error(
                             conn,
                             0x6,
@@ -1024,19 +1079,9 @@ pub async unsafe fn h2_handler(conn: &mut Connection, s: H2State) -> NextStep {
 
 fn parse_h2_frame_header(buf: &[u8]) -> H2Frame {
     let len = ((buf[0] as usize) << 16) | ((buf[1] as usize) << 8) | buf[2] as usize;
-    let kind = buf[3];
-    let flags = buf[4];
-    let stream_id = ((buf[5] as u32 & 0x7F) << 24)
-        | ((buf[6] as u32) << 16)
-        | ((buf[7] as u32) << 8)
-        | (buf[8] as u32);
+    let head = Head::parse(buf);
 
-    H2Frame {
-        length: len,
-        kind,
-        flags,
-        stream_id,
-    }
+    H2Frame { length: len, head }
 }
 
 fn build_h2_frame_header(len: usize, kind: u8, flags: u8, stream_id: u32) -> [u8; 9] {
@@ -1144,7 +1189,7 @@ async unsafe fn h2_read_headers_block(
     let mut remaining = frame.length;
     let mut pad_len = 0usize;
 
-    if frame.flags & 0x8 != 0 {
+    if frame.flags() & 0x8 != 0 {
         if remaining == 0 {
             return Err(h2_connection_error(conn, 0x1, "PADDED with zero length").await);
         }
@@ -1153,7 +1198,7 @@ async unsafe fn h2_read_headers_block(
         remaining = remaining.saturating_sub(1);
     }
 
-    if frame.flags & 0x20 != 0 {
+    if frame.flags() & 0x20 != 0 {
         if remaining < 5 {
             return Err(h2_connection_error(conn, 0x1, "PRIORITY flag missing payload").await);
         }
@@ -1168,7 +1213,7 @@ async unsafe fn h2_read_headers_block(
     let fragment_len = remaining - pad_len;
     frag.extend_from_slice(&buf[offset..offset + fragment_len]);
 
-    let mut end_headers = frame.flags & 0x4 != 0;
+    let mut end_headers = frame.flags() & 0x4 != 0;
 
     while !end_headers {
         if conn.in_len < consumed_total + 9 {
@@ -1180,7 +1225,9 @@ async unsafe fn h2_read_headers_block(
         }
 
         let next_header = parse_h2_frame_header(&buf[consumed_total..consumed_total + 9]);
-        if next_header.kind != 0x9 || next_header.stream_id != frame.stream_id {
+        if next_header.kind() != Kind::Continuation
+            || next_header.stream_id() != frame.stream_id()
+        {
             return Err(h2_connection_error(conn, 0x1, "expected CONTINUATION").await);
         }
 
@@ -1198,7 +1245,7 @@ async unsafe fn h2_read_headers_block(
 
         frag.extend_from_slice(&buf[consumed_total + 9..next_total]);
         consumed_total = next_total;
-        end_headers = next_header.flags & 0x4 != 0;
+        end_headers = next_header.flags() & 0x4 != 0;
     }
 
     Ok((frag, consumed_total))
@@ -1228,24 +1275,12 @@ fn consume_h2_frame(conn: &mut Connection, buf: &mut [u8], total: usize) {
     }
 }
 
-fn apply_h2_settings(max_frame_size: &mut usize, payload: &[u8]) {
-    let mut offset = 0;
-    while offset + 6 <= payload.len() {
-        let id = u16::from_be_bytes([payload[offset], payload[offset + 1]]);
-        let value = u32::from_be_bytes([
-            payload[offset + 2],
-            payload[offset + 3],
-            payload[offset + 4],
-            payload[offset + 5],
-        ]);
-        if id == 0x5 {
-            let v = value as usize;
-            if v >= 16384 && v <= 0x00FF_FFFF {
-                *max_frame_size = v;
-            }
-        }
-        offset += 6;
+fn apply_h2_settings(head: &Head, max_frame_size: &mut usize, payload: &[u8]) -> Result<(), Error> {
+    let settings = Settings::load(*head, payload)?;
+    if let Some(size) = settings.max_frame_size() {
+        *max_frame_size = size as usize;
     }
+    Ok(())
 }
 
 async unsafe fn h2_flush_pending_to_upstream(conn: &mut Connection) -> std::io::Result<()> {
@@ -1270,7 +1305,7 @@ async unsafe fn h2_flush_pending_to_upstream(conn: &mut Connection) -> std::io::
             break;
         }
 
-        if header.kind == 0x4 && (header.flags & 0x1 != 0) {
+        if header.kind() == Kind::Settings && (header.flags() & 0x1 != 0) {
         } else {
             let end = offset + frame_total;
             let frame_bytes = conn.h2_pending_upstream_frames[offset..end].to_vec();
@@ -1415,7 +1450,23 @@ async unsafe fn h2_connect_forward_upstream(
 
 struct H2Frame {
     length: usize,
-    kind: u8,
-    flags: u8,
-    stream_id: u32,
+    head: Head,
+}
+
+impl H2Frame {
+    fn kind(&self) -> Kind {
+        self.head.kind()
+    }
+
+    fn flags(&self) -> u8 {
+        self.head.flag()
+    }
+
+    fn stream_id(&self) -> u32 {
+        self.head.stream_id().into()
+    }
+
+    fn head(&self) -> &Head {
+        &self.head
+    }
 }

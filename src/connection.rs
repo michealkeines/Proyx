@@ -6,7 +6,7 @@ use crate::fsm::NextStep;
 use crate::handlers::*;
 use crate::states::{H1Session, ProxyState, TransportConnState};
 use hpack::{Decoder, Encoder};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::net::{UnixDatagram, UnixStream};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};

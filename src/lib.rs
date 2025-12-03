@@ -6,6 +6,7 @@ pub mod fsm;
 pub mod handlers;
 pub mod intercept;
 pub mod listener;
+pub mod protocols;
 pub mod scheduling;
 pub mod states;
 

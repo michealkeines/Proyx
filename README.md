@@ -1,2 +1,0 @@
-# Proyx
-Scable HTTP Proxy

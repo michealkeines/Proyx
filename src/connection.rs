@@ -1,4 +1,9 @@
-use std::{alloc::Layout, net::SocketAddr, ptr::NonNull};
+use std::{
+    alloc::Layout,
+    collections::{HashMap, VecDeque},
+    net::SocketAddr,
+    ptr::NonNull,
+};
 
 use crate::config::CONFIG;
 use crate::controller::ControllerMsg;
@@ -13,6 +18,52 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio_rustls::client::TlsStream as ClientTlsStream;
 use tokio_rustls::server::TlsStream as ServerTlsStream;
 type NestedServerTlsStream = ServerTlsStream<ServerTlsStream<TcpStream>>;
+
+#[derive(Debug)]
+pub struct CanonicalRequest {
+    pub stream_id: u32,
+    pub headers: Vec<(Vec<u8>, Vec<u8>)>,
+    pub data_chunks: Vec<Vec<u8>>,
+    pub ended_on_headers: bool,
+}
+
+#[derive(Debug)]
+pub struct CanonicalResponse {
+    pub stream_id: u32,
+    pub headers: Vec<(Vec<u8>, Vec<u8>)>,
+    pub data_chunks: Vec<Vec<u8>>,
+    pub ended_on_headers: bool,
+}
+
+#[derive(Debug, Default)]
+pub struct PartialH2Request {
+    pub headers: Vec<(Vec<u8>, Vec<u8>)>,
+    pub data_chunks: Vec<Vec<u8>>,
+}
+
+#[derive(Debug, Default)]
+pub struct PartialH2Response {
+    pub headers: Vec<(Vec<u8>, Vec<u8>)>,
+    pub data_chunks: Vec<Vec<u8>>,
+}
+
+impl PartialH2Request {
+    pub fn new(headers: Vec<(Vec<u8>, Vec<u8>)>) -> Self {
+        Self {
+            headers,
+            data_chunks: Vec::new(),
+        }
+    }
+}
+
+impl PartialH2Response {
+    pub fn new(headers: Vec<(Vec<u8>, Vec<u8>)>) -> Self {
+        Self {
+            headers,
+            data_chunks: Vec::new(),
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy)]
 pub enum ReadEnum {
@@ -129,6 +180,10 @@ pub struct Connection {
     pub negotiated_alpn: Option<String>,
     pub upstream_pool: Vec<PooledUpstream>,
     pub h2_pending_upstream_frames: Vec<u8>,
+    pub h2_request_queue: VecDeque<CanonicalRequest>,
+    pub h2_response_queue: VecDeque<CanonicalResponse>,
+    pub h2_stream_requests: HashMap<u32, PartialH2Request>,
+    pub h2_stream_responses: HashMap<u32, PartialH2Response>,
     pub h2_use_upstream_h2: bool,
     pub h2_client_max_frame_size: usize,
     pub h2_upstream_max_frame_size: usize,
@@ -265,6 +320,10 @@ impl Connection {
             last_activity: std::time::Instant::now(),
             upstream_pool: Vec::new(),
             h2_pending_upstream_frames: Vec::new(),
+            h2_request_queue: VecDeque::new(),
+            h2_response_queue: VecDeque::new(),
+            h2_stream_requests: HashMap::new(),
+            h2_stream_responses: HashMap::new(),
             h2_use_upstream_h2: true,
             h2_client_max_frame_size: CONFIG.h2.max_frame_size,
             h2_upstream_max_frame_size: CONFIG.h2.max_frame_size,
@@ -428,6 +487,112 @@ impl Connection {
                 });
             }
         }
+    }
+}
+
+impl Connection {
+    pub fn capture_h2_headers(
+        &mut self,
+        stream_id: u32,
+        headers: Vec<(Vec<u8>, Vec<u8>)>,
+        end_stream: bool,
+    ) -> Option<CanonicalRequest> {
+        self.h2_stream_requests
+            .insert(stream_id, PartialH2Request::new(headers));
+        if end_stream {
+            return self.finalize_h2_request(stream_id, true);
+        }
+        None
+    }
+
+    pub fn append_h2_data(
+        &mut self,
+        stream_id: u32,
+        data: &[u8],
+        end_stream: bool,
+    ) -> Option<CanonicalRequest> {
+        if let Some(entry) = self.h2_stream_requests.get_mut(&stream_id) {
+            entry.data_chunks.push(data.to_vec());
+            if end_stream {
+                return self.finalize_h2_request(stream_id, false);
+            }
+        }
+        None
+    }
+
+    fn finalize_h2_request(
+        &mut self,
+        stream_id: u32,
+        ended_on_headers: bool,
+    ) -> Option<CanonicalRequest> {
+        self.h2_stream_requests
+            .remove(&stream_id)
+            .map(|entry| CanonicalRequest {
+                stream_id,
+                headers: entry.headers,
+                data_chunks: entry.data_chunks,
+                ended_on_headers,
+            })
+    }
+
+    pub fn enqueue_h2_request(&mut self, req: CanonicalRequest) {
+        self.h2_request_queue.push_back(req);
+    }
+
+    pub fn next_h2_request(&mut self) -> Option<CanonicalRequest> {
+        self.h2_request_queue.pop_front()
+    }
+
+    pub fn capture_h2_response(
+        &mut self,
+        stream_id: u32,
+        headers: Vec<(Vec<u8>, Vec<u8>)>,
+        end_stream: bool,
+    ) -> Option<CanonicalResponse> {
+        self.h2_stream_responses
+            .insert(stream_id, PartialH2Response::new(headers));
+        if end_stream {
+            return self.finalize_h2_response(stream_id, true);
+        }
+        None
+    }
+
+    pub fn append_h2_response_data(
+        &mut self,
+        stream_id: u32,
+        data: &[u8],
+        end_stream: bool,
+    ) -> Option<CanonicalResponse> {
+        if let Some(entry) = self.h2_stream_responses.get_mut(&stream_id) {
+            entry.data_chunks.push(data.to_vec());
+            if end_stream {
+                return self.finalize_h2_response(stream_id, false);
+            }
+        }
+        None
+    }
+
+    fn finalize_h2_response(
+        &mut self,
+        stream_id: u32,
+        ended_on_headers: bool,
+    ) -> Option<CanonicalResponse> {
+        self.h2_stream_responses
+            .remove(&stream_id)
+            .map(|entry| CanonicalResponse {
+                stream_id,
+                headers: entry.headers,
+                data_chunks: entry.data_chunks,
+                ended_on_headers,
+            })
+    }
+
+    pub fn enqueue_h2_response(&mut self, resp: CanonicalResponse) {
+        self.h2_response_queue.push_back(resp);
+    }
+
+    pub fn next_h2_response(&mut self) -> Option<CanonicalResponse> {
+        self.h2_response_queue.pop_front()
     }
 }
 

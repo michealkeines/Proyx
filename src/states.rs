@@ -362,7 +362,7 @@ pub enum H2ConnBootstrapState {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum H2FrameParseState {
+pub enum H2ClientParserState {
     RecvFrameHeader,
     RecvFramePayload,
     RecvContinuation,
@@ -396,12 +396,21 @@ pub enum H2UpstreamSettingsState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum H2ProxyState {
     ProxyFramesClientToUpstream,
-    ProxyFramesUpstreamToClient,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum H2FlowControlState {
-    FlowControlWaitWindowUpdate,
+pub enum H2ClientDispatcherState {
+    DispatchClientFrame,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum H2UpstreamParserState {
+    RecvFrameHeader,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum H2TransportState {
+    WaitTransport,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -422,13 +431,15 @@ pub enum H2ControlState {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum H2State {
     Bootstrap(H2ConnBootstrapState),
-    FrameParse(H2FrameParseState),
+    ClientParser(H2ClientParserState),
     Hpack(H2HpackState),
     Intercept(H2InterceptState),
     UpstreamConnect(H2UpstreamConnectState),
     UpstreamSettings(H2UpstreamSettingsState),
     Proxy(H2ProxyState),
-    FlowControl(H2FlowControlState),
+    ClientDispatcher(H2ClientDispatcherState),
+    UpstreamParser(H2UpstreamParserState),
+    TransportWait(H2TransportState),
     Stream(H2StreamLifecycleState),
     Control(H2ControlState),
 }

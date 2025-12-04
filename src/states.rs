@@ -164,8 +164,14 @@ pub enum H2State {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InterceptPhase {
+    Request,
+    Response,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InterceptState {
-    Pipeline,
+    Pipeline(InterceptPhase),
     Drop,
 }
 

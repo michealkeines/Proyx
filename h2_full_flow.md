@@ -252,4 +252,68 @@ This keeps multiplexed request/response state localized to one queue per connect
 2. Introduce per-stream throttling tokens (or chunked body slices) so large uploads do not block the queue indefinitely; consider streaming canonical objects via iterators instead of collecting everything.
 3. Bake regression tests around partial frame sequences, stream resets, and window updates to prove that the queue doesn’t deliver outputs until a stream is fully parsed, and that flow control remains sane.
 
+# 14. Simplified H2 Lifecycle
+
+The H2 handler now exposes a minimal, state-based lifecycle that sits atop the mandatory bootstrap steps:
+
+1. **Bootstrap (ClientPreface + RecvClientSettings)** – ALPN/TLS handshake, client preface validation, SETTINGS exchange. These states remain because the protocol requires them before any application data flows.
+   * SETTINGS ACKs are handled in both directions during bootstrap (client and upstream SETTINGS get ACKed right after parsing) so the connection-level SETTINGS contract is satisfied before the canonical queue runs.
+   * CONTINUATION/HEADERS blocks are reassembled by `h2_read_headers_block`, so the `ClientRequest(ReadFrame)` state never enqueues a partial header block and RFC 7540 §4.3 is respected.
+2. **ClientRequest (ReadFrame)** – A single state that blocks until an entire frame (HEADERS/DATA) has been read, then parses pseudo-headers and bodies and constructs the canonical `HTTPRequest`.
+   * Per-stream states (idle → open → half-closed → closed) are tracked inside `Connection::h2_stream_states` while requests and responses are being buffered, fulfilling RFC 7540 §5.1 even though the macro FSM operates on the six states described here.
+3. **Interceptor/Controller Layer** – Before dispatch, the request object lives in the connection queue where policy logic (logging, header rewriting, RBAC) can run without dealing with partial frames.
+4. **Request Dispatch** – The dispatcher encodes the completed request (HEADERS + zero or more DATA frames) and writes it through the existing upstream TLS/H2 connection.
+5. **Response Collection** – Once the upstream response arrives, it is parsed frame-by-frame into a canonical `HTTPResponse` object, just as the client request was.
+6. **Response Dispatch** – The queued response is re-encoded (taking care of HPACK state) and sent back to the client before the cycle repeats.
+
+Every transition is logged so you can trace how the state machine progresses from bootstrap to request parse to dispatch and back again, and the queue always backs off until a full request/response pair is ready.
+
+# 15. ASCII Stateful Flow
+
+```
+                  +----------------------+
+                  |  Bootstrap (ALPN)    |
+                  |  ClientPreface →     |
+                  |  RecvClientSettings  |
+                  +----------┬-----------+
+                             |
+                           (client data ready)
+                             |
+                  +----------▼-----------+
+                  | ClientRequest(ReadFrame) |
+                  | - parse HEADERS+DATA     |
+                  | - build canonical req     |
+                  +----------┬-----------+
+                             |
+                    (queue enqueues request)
+                             |
+                  +----------▼-----------+
+                  |  Intercept / Controller |
+                  |  (policy hooks operate) |
+                  +----------┬-----------+
+                             |
+                  +----------▼-----------+
+                  |      Dispatch Req      |
+                  |  (encode + write upstream) |
+                  +----------┬-----------+
+                             |
+                  +----------▼-----------+
+                  | UpstreamParser(RecvFrameHeader) |
+                  | - collect HEADERS/DATA             |
+                  | - build canonical response         |
+                  +----------┬-----------+
+                             |
+                  +----------▼-----------+
+                  |   Dispatch Response   |
+                  |  (encode + write client) |
+                  +----------┬-----------+
+                             |
+                  +----------▼-----------+
+                  |   TransportWait       |
+                  |  (pump sockets, go back to parsing when data arrives) |
+                  +----------------------+
+```
+
+Each arrow corresponds to logging emitted by the FSM (`drive_connection`) during state transitions, so you can map the ASCII diagram directly to the runtime trace.
+
 # END

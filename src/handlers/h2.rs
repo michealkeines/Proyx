@@ -13,6 +13,7 @@ use crate::{
 use super::shared::{
     read_client_data, read_upstream_data, split_host_port, write_client_data, write_upstream_data,
 };
+use tokio::time::{Duration, Instant, sleep};
 
 const H2_DEFAULT_MAX_FRAME_SIZE: usize = CONFIG.h2.max_frame_size;
 
@@ -30,12 +31,8 @@ pub async unsafe fn h2_handler(conn: &mut Connection, s: H2State) -> NextStep {
             return handle_bootstrap_recv_client_settings(conn, buf).await;
         }
 
-        H2State::ClientParser(H2ClientParserState::RecvFrameHeader) => {
-            return handle_client_parser(conn, buf).await;
-        }
-
-        H2State::ClientDispatcher(H2ClientDispatcherState::DispatchClientFrame) => {
-            return handle_client_dispatcher(conn, buf).await;
+        H2State::ClientRequest(H2ClientRequestState::ReadFrame) => {
+            return handle_client_request(conn, buf).await;
         }
 
         H2State::UpstreamSettings(H2UpstreamSettingsState::UpstreamSettingsExchange) => {
@@ -361,6 +358,16 @@ pub async unsafe fn h2_handler(conn: &mut Connection, s: H2State) -> NextStep {
                         Ok(read) if read > 0 => {
                             conn.in_len = read;
                         }
+                        Ok(0) => {
+                            println!("[H2] No client data yet, waiting");
+                            return NextStep::WaitRead(ProxyState::H2(H2State::Proxy(
+                                H2ProxyState::ProxyFramesClientToUpstream,
+                            )));
+                        }
+                        Err(e) => {
+                            println!("[H2] Client read error: {}", e);
+                            return NextStep::Close;
+                        }
                         _ => return NextStep::Close,
                     }
                     if conn.in_len < 9 {
@@ -380,6 +387,16 @@ pub async unsafe fn h2_handler(conn: &mut Connection, s: H2State) -> NextStep {
                 while conn.in_len < total {
                     match read_client_data(conn, &mut buf[conn.in_len..total]).await {
                         Ok(more) if more > 0 => conn.in_len += more,
+                        Ok(0) => {
+                            println!("[H2] No client data mid-frame (waiting)");
+                            return NextStep::WaitRead(ProxyState::H2(H2State::Proxy(
+                                H2ProxyState::ProxyFramesClientToUpstream,
+                            )));
+                        }
+                        Err(e) => {
+                            println!("[H2] Client read error mid-frame: {}", e);
+                            return NextStep::Close;
+                        }
                         _ => {
                             return NextStep::WaitRead(ProxyState::H2(H2State::Proxy(
                                 H2ProxyState::ProxyFramesClientToUpstream,
@@ -649,9 +666,9 @@ async unsafe fn handle_bootstrap_recv_client_settings(
     )));
 }
 
-async unsafe fn handle_client_parser(conn: &mut Connection, buf: &mut [u8]) -> NextStep {
+async unsafe fn handle_client_request(conn: &mut Connection, buf: &mut [u8]) -> NextStep {
     println!(
-        "[H2] Enter ClientParser(RecvFrameHeader); buffered={} cap={}",
+        "[H2] Enter ClientRequest(ReadFrame); buffered={} cap={}",
         conn.in_len, conn.in_cap
     );
     let mut n = conn.in_len;
@@ -664,14 +681,17 @@ async unsafe fn handle_client_parser(conn: &mut Connection, buf: &mut [u8]) -> N
 
     if n < 9 {
         conn.in_len = n;
-        return NextStep::WaitRead(ProxyState::H2(H2State::ClientParser(
-            H2ClientParserState::RecvFrameHeader,
+        return NextStep::WaitRead(ProxyState::H2(H2State::ClientRequest(
+            H2ClientRequestState::ReadFrame,
         )));
     }
 
     conn.in_len = n;
 
     let frame = parse_h2_frame_header(&buf[..9]);
+    let payload_len = frame.length;
+    let total = 9 + payload_len;
+
     println!(
         "[H2] Frame parsed len={} type={} flags=0x{:02x} stream={}",
         frame.length,
@@ -680,53 +700,25 @@ async unsafe fn handle_client_parser(conn: &mut Connection, buf: &mut [u8]) -> N
         frame.stream_id()
     );
 
-    conn.scratch = ((frame.stream_id() as u64) << 32) | frame.length as u64;
-
-    NextStep::Continue(ProxyState::H2(H2State::ClientDispatcher(
-        H2ClientDispatcherState::DispatchClientFrame,
-    )))
-}
-
-async unsafe fn handle_client_dispatcher(conn: &mut Connection, buf: &mut [u8]) -> NextStep {
-    let payload_len = (conn.scratch & 0xffff_ffff) as usize;
-
-    println!(
-        "[H2] Enter ClientDispatcher; payload_len={} client_max={}",
-        payload_len, conn.h2_client_max_frame_size
-    );
-
     if payload_len > conn.h2_client_max_frame_size {
         return h2_connection_error(conn, 0x6, "frame payload exceeds max frame size").await;
     }
 
-    if payload_len + 9 > conn.in_len {
-        println!(
-            "[H2] Frame payload truncated (expected {} + 9, got {}), reading more",
-            payload_len, conn.in_len
-        );
-        let need = payload_len + 9 - conn.in_len;
-        let start = conn.in_len;
-        if start + need > conn.in_cap {
-            return h2_connection_error(conn, 0x6, "frame larger than buffer").await;
-        }
-        match read_client_data(conn, &mut buf[start..start + need]).await {
-            Ok(got) if got == need => {
-                conn.in_len += got;
-            }
-            Ok(_) => {
-                return NextStep::WaitRead(ProxyState::H2(H2State::ClientDispatcher(
-                    H2ClientDispatcherState::DispatchClientFrame,
+    if total > conn.in_cap {
+        println!("[H2] Frame exceeds buffer: {}", total);
+        return NextStep::Close;
+    }
+
+    while conn.in_len < total {
+        match read_client_data(conn, &mut buf[conn.in_len..total]).await {
+            Ok(more) if more > 0 => conn.in_len += more,
+            _ => {
+                return NextStep::WaitRead(ProxyState::H2(H2State::ClientRequest(
+                    H2ClientRequestState::ReadFrame,
                 )));
-            }
-            Err(e) => {
-                println!("[H2] Failed reading frame payload: {}", e);
-                return NextStep::Close;
             }
         }
     }
-
-    let frame = parse_h2_frame_header(&buf[..9]);
-    let total = 9 + payload_len;
 
     if let Some(connect_stream) = conn.h2_connect_stream_id {
         if frame.stream_id() == connect_stream && frame.kind() == Kind::Data {
@@ -798,16 +790,13 @@ async unsafe fn handle_client_dispatcher(conn: &mut Connection, buf: &mut [u8]) 
 
         let end_stream = frame.flags() & 0x1 != 0;
         let is_connect = method.eq_ignore_ascii_case("CONNECT");
-        if !is_connect {
-            if let Some(req) = conn.capture_h2_headers(frame.stream_id(), headers, end_stream) {
-                conn.enqueue_h2_request(req);
-                if let Err(e) = dispatch_h2_request_queue(conn).await {
-                    println!("[H2] Dispatch failure: {}", e);
-                    return NextStep::Close;
-                }
+        conn.mark_stream_headers(frame.stream_id(), end_stream);
+        if let Some(req) = conn.capture_h2_headers(frame.stream_id(), headers, end_stream) {
+            conn.enqueue_h2_request(req);
+            if let Err(e) = dispatch_h2_request_queue(conn).await {
+                println!("[H2] Dispatch failure: {}", e);
+                return NextStep::Close;
             }
-        } else {
-            println!("[H2] CONNECT detected on stream {}", frame.stream_id());
         }
 
         consume_h2_frame(conn, buf, consumed_total);
@@ -870,6 +859,7 @@ async unsafe fn handle_client_dispatcher(conn: &mut Connection, buf: &mut [u8]) 
         let data_len = remaining - pad_len;
         let data = &buf[offset..offset + data_len];
 
+        conn.mark_stream_data(frame.stream_id(), frame.flags() & 0x1 != 0);
         if let Some(req) = conn.append_h2_data(frame.stream_id(), data, frame.flags() & 0x1 != 0) {
             conn.enqueue_h2_request(req);
             if let Err(e) = dispatch_h2_request_queue(conn).await {
@@ -1064,13 +1054,18 @@ async unsafe fn handle_transport_wait(conn: &mut Connection, _buf: &mut [u8]) ->
         conn.upstream_tcp.is_some() || conn.upstream_tls.is_some()
     );
 
+    if let Err(e) = pump_h2_queues(conn).await {
+        println!("[H2] Pump dispatch queues failed: {}", e);
+        return NextStep::Close;
+    }
+
     if conn.in_len >= 9 {
         println!(
             "[H2] TransportWait sees buffered client data ({} bytes), resuming client parser",
             conn.in_len
         );
-        return NextStep::Continue(ProxyState::H2(H2State::ClientParser(
-            H2ClientParserState::RecvFrameHeader,
+        return NextStep::Continue(ProxyState::H2(H2State::ClientRequest(
+            H2ClientRequestState::ReadFrame,
         )));
     }
 
@@ -1081,23 +1076,25 @@ async unsafe fn handle_transport_wait(conn: &mut Connection, _buf: &mut [u8]) ->
             return NextStep::Close;
         }
         println!("[H2] TransportWait client became readable");
-        return NextStep::Continue(ProxyState::H2(H2State::ClientParser(
-            H2ClientParserState::RecvFrameHeader,
+        return NextStep::Continue(ProxyState::H2(H2State::ClientRequest(
+            H2ClientRequestState::ReadFrame,
         )));
     }
 
-    let mut client_ready = wait_client_transport_readable(conn);
+    let client_ready = wait_client_transport_readable(conn);
     tokio::pin!(client_ready);
-    let mut upstream_ready = wait_upstream_transport_readable(conn);
+    let upstream_ready = wait_upstream_transport_readable(conn);
     tokio::pin!(upstream_ready);
+    let dispatch_timer = sleep(H2_DISPATCH_INTERVAL);
+    tokio::pin!(dispatch_timer);
 
     tokio::select! {
         res = &mut client_ready => {
             match res {
                 Ok(_) => {
                     println!("[H2] TransportWait: client readable");
-                    NextStep::Continue(ProxyState::H2(H2State::ClientParser(
-                        H2ClientParserState::RecvFrameHeader,
+                    NextStep::Continue(ProxyState::H2(H2State::ClientRequest(
+                        H2ClientRequestState::ReadFrame,
                     )))
                 }
                 Err(e) => {
@@ -1119,6 +1116,15 @@ async unsafe fn handle_transport_wait(conn: &mut Connection, _buf: &mut [u8]) ->
                     NextStep::Close
                 }
             }
+        }
+        _ = &mut dispatch_timer => {
+            println!(
+                "[H2] Dispatch timer tick; rechecking transport wait (interval={:?})",
+                H2_DISPATCH_INTERVAL
+            );
+            NextStep::Continue(ProxyState::H2(H2State::TransportWait(
+                H2TransportState::WaitTransport,
+            )))
         }
     }
 }
@@ -1526,8 +1532,17 @@ async unsafe fn dispatch_h2_response_queue(conn: &mut Connection) -> std::io::Re
             let data_frame = build_h2_data_frame(resp.stream_id, &[], true);
             write_client_data(conn, &data_frame).await?;
         }
+        conn.mark_response_complete(resp.stream_id);
     }
 
+    Ok(())
+}
+
+const H2_DISPATCH_INTERVAL: Duration = Duration::from_millis(50);
+
+async unsafe fn pump_h2_queues(conn: &mut Connection) -> std::io::Result<()> {
+    dispatch_h2_request_queue(conn).await?;
+    dispatch_h2_response_queue(conn).await?;
     Ok(())
 }
 

@@ -251,7 +251,6 @@ pub enum DetectAwaitState {
 pub enum DetectResultState {
     ProtocolSelectedH1,
     ProtocolSelectedH2,
-    ProtocolSelectedH3,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -268,294 +267,44 @@ pub enum DetectState {
     Error(DetectErrorState),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum H1RequestParseState {
-    RecvHeaders,
-    HeadersComplete,
-    RecvBody,
-    BodyComplete,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum H1ChunkedState {
-    ChunkedSize,
-    ChunkedData,
-    ChunkedTrailer,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum H1ContinueState {
-    ExpectContinue,
-    SendContinue,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum H1ConnectState {
-    ConnectTunnelEstablished,
-    ConnectTunnelTransfer,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum H1InterceptState {
-    SendToController,
-    WaitControllerDecision,
-    ApplyModification,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum H1UpstreamConnectState {
-    ResolveUpstreamDNS,
-    ConnectUpstreamTcp,
-    UpstreamTcpEstablished,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum H1UpstreamTlsState {
-    UpstreamTlsHandshakeBegin,
-    UpstreamTlsHandshakeRead,
-    UpstreamTlsHandshakeWrite,
-    UpstreamTlsHandshakeComplete,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum H1UpstreamProtoSelectState {
-    UpstreamProtocolSelect,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum H1ForwardState {
-    ForwardRequestHeaders,
-    ForwardRequestBody,
-    UpstreamRecvHeaders,
-    UpstreamRecvBody,
-    SendResponseHeadersToClient,
-    SendResponseBodyToClient,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum H1ConnLifecycleState {
-    ClientClosed,
-    UpstreamClosed,
-    CheckKeepAlive,
-    PrepareNextRequest,
-    CloseConnection,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum H1State {
-    Request(H1RequestParseState),
-    Chunked(H1ChunkedState),
-    Continue(H1ContinueState),
-    Connect(H1ConnectState),
-    Intercept(H1InterceptState),
-    UpstreamConnect(H1UpstreamConnectState),
-    UpstreamTls(H1UpstreamTlsState),
-    UpstreamProtoSelect(H1UpstreamProtoSelectState),
-    Forward(H1ForwardState),
-    Lifecycle(H1ConnLifecycleState),
+    RequestHeaders,
+    RequestBody,
+    RequestReadyForController,
+    DispatchToUpstream,
+    ResponseHeaders,
+    ResponseBody,
+    ResponseComplete,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum H2ConnBootstrapState {
-    ClientPreface,
-    RecvClientSettings,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum H2ClientParserState {
-    RecvFrameHeader,
-    RecvFramePayload,
-    RecvContinuation,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum H2HpackState {
-    HpackDecode,
-    HpackTableUpdate,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum H2InterceptState {
-    SendToController,
-    WaitControllerDecision,
-    ApplyModification,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum H2UpstreamConnectState {
-    ConnectUpstreamTcp,
-    UpstreamTlsHandshakeBegin,
-    UpstreamTlsHandshakeComplete,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum H2UpstreamSettingsState {
-    UpstreamSettingsExchange,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum H2ProxyState {
-    ProxyFramesClientToUpstream,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum H2ClientDispatcherState {
-    DispatchClientFrame,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum H2UpstreamParserState {
-    RecvFrameHeader,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum H2TransportState {
-    WaitTransport,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum H2StreamLifecycleState {
-    StreamHalfClosedRemote,
-    StreamHalfClosedLocal,
-    StreamClosed,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum H2ControlState {
-    StreamReset,
-    PriorityUpdate,
-    GoawayReceived,
-    GoawaySent,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum H2State {
-    Bootstrap(H2ConnBootstrapState),
-    ClientParser(H2ClientParserState),
-    Hpack(H2HpackState),
-    Intercept(H2InterceptState),
-    UpstreamConnect(H2UpstreamConnectState),
-    UpstreamSettings(H2UpstreamSettingsState),
-    Proxy(H2ProxyState),
-    ClientDispatcher(H2ClientDispatcherState),
-    UpstreamParser(H2UpstreamParserState),
-    TransportWait(H2TransportState),
-    Stream(H2StreamLifecycleState),
-    Control(H2ControlState),
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum H3ControlState {
-    ControlStreamSetup,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum H3RequestParseState {
-    RecvHeaders,
-    RecvBody,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum H3ResponseParseState {
-    RecvResponseHeaders,
-    RecvResponseBody,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum H3QpackState {
-    QpackDecodeHeaders,
-    QpackTableUpdate,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum H3DatagramState {
-    RecvDatagram,
-    SendDatagram,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum H3ZeroRttState {
-    ZeroRttRequest,
-    ZeroRttResponse,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum H3InterceptState {
-    SendToController,
-    WaitControllerDecision,
-    ApplyModification,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum H3UpstreamState {
-    ConnectUpstream,
-    UpstreamQuicHandshake,
-    UpstreamQuicReady,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum H3ForwardState {
-    ForwardHeaders,
-    ForwardBody,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum H3StreamLifecycleState {
-    StreamReset,
-    StreamsDone,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum H3SessionState {
-    FinalizeConnection,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum H3State {
-    Control(H3ControlState),
-
-    RequestParse(H3RequestParseState),
-    ResponseParse(H3ResponseParseState),
-
-    Qpack(H3QpackState),
-
-    Datagram(H3DatagramState),
-
-    ZeroRtt(H3ZeroRttState),
-
-    Intercept(H3InterceptState),
-
-    Upstream(H3UpstreamState),
-
-    Forward(H3ForwardState),
-
-    Stream(H3StreamLifecycleState),
-
-    Session(H3SessionState),
+    Bootstrap,
+    ClientFrameParse,
+    BuildCanonicalRequest,
+    RequestQueueEnqueue,
+    ControllerHook,
+    DispatchToUpstream,
+    UpstreamFrameCollect,
+    ResponseDispatch,
+    TransportWait,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InterceptPipelineState {
-    SendRawToController,
-    WaitControllerDecision,
-    ApplyControllerModification,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum InterceptBodyState {
-    InterceptReadBody,
-    InterceptWriteBody,
+    Request,
+    Response,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InterceptDropState {
-    InterceptDropConnection,
+    Connection,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InterceptState {
     Pipeline(InterceptPipelineState),
-    Body(InterceptBodyState),
     Drop(InterceptDropState),
 }
 
@@ -602,7 +351,6 @@ pub enum UpstreamProtocolState {
     DetectProtocol,
     ProtocolSelectedH1,
     ProtocolSelectedH2,
-    ProtocolSelectedH3,
     ProtocolDetectFailed,
 }
 

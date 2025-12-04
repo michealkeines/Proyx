@@ -140,15 +140,11 @@ pub async unsafe fn tls_handler(conn: &mut Connection, s: TlsState) -> NextStep 
 
             if let Some(alpn) = &conn.negotiated_alpn {
                 if alpn == "h2" {
-                    return NextStep::Continue(ProxyState::H2(H2State::Bootstrap(
-                        H2ConnBootstrapState::ClientPreface,
-                    )));
+                    return NextStep::Continue(ProxyState::H2(H2State::Bootstrap));
                 }
             }
 
-            return NextStep::Continue(ProxyState::H1(H1State::Request(
-                H1RequestParseState::RecvHeaders,
-            )));
+            return NextStep::Continue(ProxyState::H1(H1State::RequestHeaders));
         }
 
         _ => {

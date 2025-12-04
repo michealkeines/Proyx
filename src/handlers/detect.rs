@@ -3,10 +3,7 @@ use tokio::io::AsyncReadExt;
 use crate::{
     connection::Connection,
     fsm::NextStep,
-    states::{
-        DetectBootstrapState, DetectState, H1ConnectState, H1RequestParseState, H1State,
-        ProxyState, TlsHandshakeState, TlsState,
-    },
+    states::{DetectBootstrapState, DetectState, H1State, ProxyState, TlsHandshakeState, TlsState},
 };
 
 use super::shared::looks_like_http1;
@@ -36,10 +33,7 @@ pub async unsafe fn detect_handler(conn: &mut Connection, s: DetectState) -> Nex
 
             if slice.starts_with(b"CONNECT ") {
                 println!("[DETECT] CONNECT request detected");
-
-                return NextStep::Continue(ProxyState::H1(H1State::Connect(
-                    H1ConnectState::ConnectTunnelEstablished,
-                )));
+                return NextStep::Continue(ProxyState::H1(H1State::RequestHeaders));
             }
 
             if slice.len() > 5 && slice[0] == 0x16 && slice[1] == 0x03 {
@@ -52,9 +46,7 @@ pub async unsafe fn detect_handler(conn: &mut Connection, s: DetectState) -> Nex
 
             if looks_like_http1(slice) {
                 println!("[DETECT] HTTP/1.x detected");
-                return NextStep::Continue(ProxyState::H1(H1State::Request(
-                    H1RequestParseState::RecvHeaders,
-                )));
+                return NextStep::Continue(ProxyState::H1(H1State::RequestHeaders));
             }
 
             println!("[DETECT] Unknown protocol – closing");

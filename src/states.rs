@@ -1,76 +1,110 @@
-use std::alloc::Layout;
-use std::ptr::NonNull;
+use std::{
+    alloc::{Layout, alloc_zeroed, dealloc},
+    ptr::NonNull,
+};
 
-use crate::config::CONFIG;
+const H1_HEADERS_CAP: usize = 64 * 1024;
+const H1_BODY_MAX: usize = 64 * 1024;
+const RAW_ALIGN: usize = 32;
 
+/// Small helper that keeps ownership of the raw buffers that `H1Session` manipulates.
 pub struct H1Session {
-    pub headers: NonNull<u8>,
-    pub headers_cap: usize,
-    pub body: Option<NonNull<u8>>,
-    pub body_cap: usize,
-    pub headers_count: Option<u64>,
-    pub body_len: Option<u64>,
-    pub parsed_headers: bool,
-    pub parsed_body: bool,
-    pub content_len: Option<u64>,
-    pub is_chunked: bool,
-    pub keep_alive: bool,
-    pub chunk_remaining: u64,
-    pub expect_continue: bool,
-    pub is_head: bool,
-    pub is_connect: bool,
-    pub version_1_0: bool,
+    headers: NonNull<u8>,
+    headers_cap: usize,
+    body: Option<NonNull<u8>>,
+    body_cap: usize,
+    headers_len: usize,
+    body_len: usize,
 }
 
 impl H1Session {
-    pub unsafe fn allocate_body(&mut self) -> bool {
-        if (self.body_len.is_none()) {
-            return false;
-        }
-        let len = self.body_len.unwrap();
-        if (len == 0) {
-            return false;
-        }
-        let k = CONFIG.buffers.h1_body_max as u64;
-        if (len > k) {
-            println!("BODY SIZE is too big\n");
-            return false;
-        }
+    pub fn new() -> Self {
+        let layout = Layout::from_size_align(H1_HEADERS_CAP, RAW_ALIGN)
+            .expect("state buffers use a fixed alignment");
+        let raw = unsafe { alloc_zeroed(layout) };
+        let headers = NonNull::new(raw).expect("failed to allocate h1 headers buffer");
 
-        self.body = {
-            let raw = std::alloc::alloc_zeroed(
-                std::alloc::Layout::from_size_align(len as usize, 32).unwrap(),
-            );
-            Some(NonNull::new(raw).expect("failed alloc headers buf"))
-        };
-        self.body_cap = len as usize;
-
-        return true;
-    }
-    pub unsafe fn new() -> H1Session {
-        let in_cap = CONFIG.buffers.h1_headers_cap;
-        let headers = {
-            let raw =
-                std::alloc::alloc_zeroed(std::alloc::Layout::from_size_align(in_cap, 32).unwrap());
-            NonNull::new(raw).expect("failed alloc headers buf")
-        };
         Self {
-            headers: headers,
-            headers_cap: in_cap,
+            headers,
+            headers_cap: H1_HEADERS_CAP,
             body: None,
             body_cap: 0,
-            headers_count: None,
-            body_len: None,
-            parsed_body: false,
-            parsed_headers: false,
-            content_len: None,
-            is_chunked: false,
-            keep_alive: false,
-            chunk_remaining: 0,
-            expect_continue: false,
-            is_head: false,
-            is_connect: false,
-            version_1_0: false,
+            headers_len: 0,
+            body_len: 0,
+        }
+    }
+
+    pub unsafe fn allocate_body(&mut self, len: usize) -> bool {
+        if len == 0 || len > H1_BODY_MAX {
+            return false;
+        }
+
+        if let Some(ptr) = self.body.take() {
+            let layout = Layout::from_size_align(self.body_cap, RAW_ALIGN)
+                .expect("body layout already validated");
+            unsafe {
+                dealloc(ptr.as_ptr(), layout);
+            }
+        }
+
+        let layout = match Layout::from_size_align(len, RAW_ALIGN) {
+            Ok(layout) => layout,
+            Err(_) => return false,
+        };
+
+        let raw = unsafe { alloc_zeroed(layout) };
+        let body = match NonNull::new(raw) {
+            Some(ptr) => ptr,
+            None => return false,
+        };
+
+        self.body = Some(body);
+        self.body_cap = len;
+        self.body_len = len;
+        true
+    }
+
+    pub fn headers_ptr(&self) -> NonNull<u8> {
+        self.headers
+    }
+
+    pub fn headers_capacity(&self) -> usize {
+        self.headers_cap
+    }
+
+    pub fn headers_length(&self) -> usize {
+        self.headers_len
+    }
+
+    pub fn body_ptr(&self) -> Option<NonNull<u8>> {
+        self.body
+    }
+
+    pub fn body_capacity(&self) -> usize {
+        self.body_cap
+    }
+
+    pub fn body_length(&self) -> usize {
+        self.body_len
+    }
+
+    pub fn mark_headers_parsed(&mut self, len: usize) {
+        self.headers_len = len.min(self.headers_cap);
+    }
+
+    pub fn mark_body_parsed(&mut self, len: usize) {
+        self.body_len = len.min(self.body_cap);
+    }
+
+    pub unsafe fn release_body(&mut self) {
+        if let Some(ptr) = self.body.take() {
+            let layout =
+                Layout::from_size_align(self.body_cap, RAW_ALIGN).expect("body layout consistent");
+            unsafe {
+                dealloc(ptr.as_ptr(), layout);
+            }
+            self.body_cap = 0;
+            self.body_len = 0;
         }
     }
 }
@@ -78,16 +112,14 @@ impl H1Session {
 impl Drop for H1Session {
     fn drop(&mut self) {
         unsafe {
-            if self.headers_cap > 0 {
-                let layout = Layout::from_size_align(self.headers_cap, 32).unwrap();
-                std::alloc::dealloc(self.headers.as_ptr(), layout);
-            }
+            let layout = Layout::from_size_align(self.headers_cap, RAW_ALIGN)
+                .expect("header layout consistent");
+            dealloc(self.headers.as_ptr(), layout);
 
-            if let Some(body_ptr) = self.body.take() {
-                if self.body_cap > 0 {
-                    let layout = Layout::from_size_align(self.body_cap, 32).unwrap();
-                    std::alloc::dealloc(body_ptr.as_ptr(), layout);
-                }
+            if let Some(body_ptr) = self.body {
+                let layout = Layout::from_size_align(self.body_cap, RAW_ALIGN)
+                    .expect("body layout consistent");
+                dealloc(body_ptr.as_ptr(), layout);
             }
         }
     }
@@ -95,179 +127,19 @@ impl Drop for H1Session {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProxyState {
-    Transport(TransportState),
-    Tls(TlsState),
-    Quic(QuicState),
-    Detect(DetectState),
-    H1(H1State),
-    H2(H2State),
-    H3(H3State),
+    TransportBootstrap,
+    TransportIo,
+    TlsHandshake,
+    ProtocolSelect,
+    ConnectionReady,
+    H1Session(H1State),
+    H2Session(H2State),
     Intercept(InterceptState),
     Upstream(UpstreamState),
-    Stream(StreamState),
     Shutdown(ShutdownState),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TransportConnState {
-    AcceptClientConnection,
-    ClientTcpHandshake,
-    ClientTcpEstablished,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TransportIoState {
-    ClientReadInitialData,
-    ClientWritePendingData,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TransportDetectState {
-    ClientDetectTls,
-    ClientDetectQuic,
-    ClientDetectProtocolGuess,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TransportKeepaliveState {
-    ClientKeepAliveIdle,
-    ClientKeepAliveTimeout,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TransportState {
-    Conn(TransportConnState),
-    Io(TransportIoState),
-    Detect(TransportDetectState),
-    KeepAlive(TransportKeepaliveState),
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TlsHandshakeState {
-    HandshakeBegin,
-    HandshakeRead,
-    HandshakeWrite,
-    HandshakePending,
-    HandshakeComplete,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TlsAlpnState {
-    AlpnStart,
-    AlpnComplete,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TlsClientAuthState {
-    ExpectClientCertificate,
-    VerifyClientCertificate,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TlsRenegotiationState {
-    RenegotiationBegin,
-    RenegotiationPending,
-    RenegotiationComplete,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TlsShutdownState {
-    ShutdownBegin,
-    ShutdownWrite,
-    ShutdownComplete,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum TlsState {
-    Handshake(TlsHandshakeState),
-    Alpn(TlsAlpnState),
-    ClientAuth(TlsClientAuthState),
-    Renegotiation(TlsRenegotiationState),
-    Shutdown(TlsShutdownState),
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum QuicInitialState {
-    InitialPacket,
-    VersionNegotiation,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum QuicZeroRttState {
-    ZeroRttDataRecv,
-    ZeroRttAccepted,
-    ZeroRttRejected,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum QuicHandshakeState {
-    CryptoSetup,        // parse CRYPTO frames
-    Handshake,          // handshake keys in progress
-    HandshakeConfirmed, // handshake keys confirmed
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum QuicReadyState {
-    TransportReady, // 1-RTT keys active, streams can open
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum QuicStreamState {
-    StreamOpen,
-    StreamRecv,
-    StreamSend,
-    StreamHalfClosedLocal,
-    StreamHalfClosedRemote,
-    StreamClosed,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum QuicPathState {
-    ConnectionMigrationStart,
-    ConnectionMigrationComplete,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum QuicState {
-    Initial(QuicInitialState),
-    ZeroRtt(QuicZeroRttState),
-    Handshake(QuicHandshakeState),
-    Ready(QuicReadyState),
-    Stream(QuicStreamState),
-    Path(QuicPathState),
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DetectBootstrapState {
-    DetectProtocolBegin,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DetectAwaitState {
-    WaitingForProtocolDecision,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DetectResultState {
-    ProtocolSelectedH1,
-    ProtocolSelectedH2,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DetectErrorState {
-    ProtocolUnknown,
-    ProtocolSelectionError,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum DetectState {
-    Bootstrap(DetectBootstrapState),
-    Await(DetectAwaitState),
-    Result(DetectResultState),
-    Error(DetectErrorState),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum H1State {
     RequestHeaders,
     RequestBody,
@@ -292,134 +164,23 @@ pub enum H2State {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum InterceptPipelineState {
-    Request,
-    Response,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum InterceptDropState {
-    Connection,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InterceptState {
-    Pipeline(InterceptPipelineState),
-    Drop(InterceptDropState),
+    Pipeline,
+    Drop,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum UpstreamDnsState {
-    ResolveStart,
-    ResolveWait,
-    ResolveComplete,
-    ResolveFailed,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum UpstreamTcpState {
-    TcpConnectBegin,
-    TcpConnectWaitWritable,
-    TcpConnectEstablished,
-    TcpConnectFailed,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum UpstreamTlsState {
-    TlsHandshakeBegin,
-    TlsHandshakeRead,
-    TlsHandshakeWrite,
-    TlsHandshakePending,
-    TlsHandshakeComplete,
-    TlsHandshakeFailed,
-}
-
-/// QUIC upstream handshake + transport bootstrap.
-/// This reuses the same QUIC logic internally, but upstream-specific events live here.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum UpstreamQuicState {
-    QuicInitialPacket,
-    QuicCryptoSetup,
-    QuicHandshake,
-    QuicHandshakeConfirmed,
-    QuicTransportReady,
-    QuicConnectionFailed,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum UpstreamProtocolState {
-    DetectProtocol,
-    ProtocolSelectedH1,
-    ProtocolSelectedH2,
-    ProtocolDetectFailed,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum UpstreamTimeoutState {
-    ConnectTimeout,
-    ReadTimeout,
-    WriteTimeout,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum UpstreamRetryState {
-    RetryConnect,
-    FallbackServer,
-    NoMoreFallbacks,
-}
-
-/// Unified upstream state wrapper
-#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UpstreamState {
-    Dns(UpstreamDnsState),
-    Tcp(UpstreamTcpState),
-    Tls(UpstreamTlsState),
-    Quic(UpstreamQuicState),
-    Protocol(UpstreamProtocolState),
-    Timeout(UpstreamTimeoutState),
-    Retry(UpstreamRetryState),
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum StreamDirectionState {
-    ClientToUpstream,
-    UpstreamToClient,
-    Bidirectional,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum StreamWaitState {
-    WaitClientReadable,
-    WaitUpstreamReadable,
-    WaitClientWritable,
-    WaitUpstreamWritable,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum StreamBackpressureState {
-    BackpressureClient,
-    BackpressureUpstream,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum StreamTerminationState {
-    StreamTlsShutdown,
-    StreamQuicFin,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum StreamState {
-    Direction(StreamDirectionState),
-    Wait(StreamWaitState),
-    Backpressure(StreamBackpressureState),
-    Termination(StreamTerminationState),
+    ResolveDns,
+    ConnectTcp,
+    TlsHandshake,
+    DispatchRequest,
+    CollectResponse,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShutdownState {
-    GracefulShutdown,
-    ShutdownDrainBuffers,
-    ShutdownWaitUpstreamClose,
-    ForcedClose,
+    GracefulDrain,
+    ShutdownBuffers,
     Closed,
 }

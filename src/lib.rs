@@ -23,6 +23,7 @@ pub use tokio_native_tls;
 
 #[cfg(any(feature = "native-tls-client", feature = "rustls-client"))]
 pub mod default_client;
+mod state_machine;
 mod tls;
 
 #[cfg(any(feature = "native-tls-client", feature = "rustls-client"))]
@@ -129,7 +130,7 @@ where
     {
         service_fn(move |req| {
             let proxy = proxy.clone();
-            let mut service = service.clone();
+            let service = service.clone();
 
             async move {
                 if req.method() == Method::CONNECT {
@@ -184,11 +185,12 @@ where
                             };
                             let f = move |mut req: Request<_>| {
                                 let connect_authority = connect_authority.clone();
-                                let mut service = service.clone();
+                                let proxy = proxy.clone();
+                                let service = service.clone();
 
                                 async move {
                                     inject_authority(&mut req, connect_authority.clone());
-                                    service.call(req).await
+                                    state_machine::process_request(proxy, service, req).await
                                 }
                             };
                             let res = if client.get_ref().1.alpn_protocol() == Some(b"h2") {
@@ -235,7 +237,7 @@ where
                     ))
                 } else {
                     // http
-                    service.call(req).await.map(|res| res.map(|b| b.boxed()))
+                    state_machine::process_request(proxy.clone(), service.clone(), req).await
                 }
             }
         })

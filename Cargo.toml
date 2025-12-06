@@ -1,12 +1,12 @@
 [package]
-name = "http-mitm-proxy"
-version = "0.16.0"
-description = "A HTTP proxy server library intended to be a backend of application like Burp proxy."
+name = "Proyx"
+version = "0.1.0"
+description = "A HTTP proxy server for MITM"
 readme = "README.md"
-repository = "https://github.com/hatoo/http-mitm-proxy"
+repository = "https://github.com/michealkeines/Proyx"
 edition = "2024"
 
-authors = ["hatoo <hato2000@gmail.com>"]
+authors = ["michealkeines <michealkeines@gmail.com>"]
 license = "MIT"
 categories = ["network-programming", "web-programming::http-server"]
 keywords = ["http", "proxy", "http-proxy"]
@@ -41,6 +41,8 @@ tracing = "0.1.40"
 tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
 hyper-util = { version = "0.1.11", features = ["tokio"] }
 thiserror = "2.0.12"
+serde = { version = "1.0.188", features = ["derive"] }
+toml = "0.7.3"
 moka = { version = "0.12.8", features = ["sync"] }
 
 native-tls = { version = "0.2.12", features = ["alpn"], optional = true }

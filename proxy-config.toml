@@ -1,0 +1,4 @@
+address = "127.0.0.1:8080"
+cache_capacity = 1024
+ca_dir = "./proxy-ca"
+log_level = "info"

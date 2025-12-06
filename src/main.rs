@@ -1,4 +1,7 @@
-use http_mitm_proxy::{MitmProxy, default_client::DefaultClient};
+mod config;
+
+use config::Config;
+use Proyx::{MitmProxy, default_client::DefaultClient};
 use hyper::{Request, body::Incoming, service::service_fn};
 use moka::sync::Cache;
 use rcgen::{
@@ -6,6 +9,7 @@ use rcgen::{
     KeyUsagePurpose,
 };
 use std::{env, error::Error as StdError, fs, net::SocketAddr, path::Path};
+use tracing_subscriber::EnvFilter;
 
 fn make_root_issuer() -> (rcgen::Issuer<'static, KeyPair>, String, String) {
     let mut params = CertificateParams::default();
@@ -48,16 +52,15 @@ fn load_or_create_ca<P: AsRef<Path>>(
     }
 }
 
-fn ca_storage_dir() -> String {
-    env::var("PROXY_CA_DIR").unwrap_or_else(|_| "./proxy-ca".into())
-}
-
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn StdError>> {
-    tracing_subscriber::fmt().init();
+    let config_path = env::var("PROXY_CONFIG").unwrap_or_else(|_| "proxy-config.toml".into());
+    let config = Config::load(Path::new(&config_path))?;
+    tracing_subscriber::fmt()
+        .with_env_filter(EnvFilter::new(&config.log_level))
+        .init();
 
-    let ca_dir = ca_storage_dir();
-    let (root_issuer, ca_pem, ca_key) = load_or_create_ca(&ca_dir)?;
+    let (root_issuer, ca_pem, ca_key) = load_or_create_ca(&config.ca_dir)?;
     println!();
     println!("=== Trust this CA in your browser ===");
     println!("{ca_pem}");
@@ -68,8 +71,8 @@ async fn main() -> Result<(), Box<dyn StdError>> {
     );
     println!();
 
-    let proxy = MitmProxy::new(Some(root_issuer), Some(Cache::new(1024)));
-    let addr = SocketAddr::from(([127, 0, 0, 1], 8080));
+    let proxy = MitmProxy::new(Some(root_issuer), Some(Cache::new(config.cache_capacity)));
+    let addr: SocketAddr = config.address.parse()?;
 
     let client = DefaultClient::new();
     let service = service_fn(move |req: Request<Incoming>| {
@@ -81,7 +84,7 @@ async fn main() -> Result<(), Box<dyn StdError>> {
                     let _ = handle.await;
                 });
             }
-            Ok::<_, http_mitm_proxy::default_client::Error>(res)
+            Ok::<_, Proyx::default_client::Error>(res)
         }
     });
 

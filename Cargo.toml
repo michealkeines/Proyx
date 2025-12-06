@@ -35,7 +35,7 @@ hyper = { version = "1.0.1", features = ["http1", "http2", "server", "client"] }
 futures = "0.3.29"
 bytes = "1.7.1"
 http-body-util = "0.1.0"
-rcgen = "0.14.3"
+rcgen = { version = "0.14.3", features = ["pem", "x509-parser"] }
 tokio-rustls = "0.26.1"
 tracing = "0.1.40"
 tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }

@@ -1,6 +1,7 @@
-// Prevents additional console window on Windows in release, DO NOT REMOVE!!
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-fn main() {
+use std::error::Error as StdError;
+
+fn main() -> Result<(), Box<dyn StdError>> {
     proyxui_lib::run()
 }

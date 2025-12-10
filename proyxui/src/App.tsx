@@ -1,51 +1,82 @@
-import { useState } from "react";
-import reactLogo from "./assets/react.svg";
-import { invoke } from "@tauri-apps/api/core";
+import { useMemo, useState } from "react";
+import { ConnectionProvider, useConnectionStore } from "./state/connection-store";
+import { ConnectionStateBadge } from "./components/ConnectionStateBadge";
+import { TabBar } from "./components/TabBar";
+import { baseTabDescriptors } from "./tabs/descriptors";
 import "./App.css";
 
-function App() {
-  const [greetMsg, setGreetMsg] = useState("");
-  const [name, setName] = useState("");
+const AppContent = () => {
+  const { state } = useConnectionStore();
+  const [activeTab, setActiveTab] = useState(baseTabDescriptors[0].id);
 
-  async function greet() {
-    // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
-    setGreetMsg(await invoke("greet", { name }));
-  }
+  const interceptedCount = useMemo(
+    () => state.connections.filter((connection) => connection.state === "intercept").length,
+    [state.connections],
+  );
+
+  const tabsWithBadges = useMemo(() => {
+    return baseTabDescriptors.map((tab) => ({
+      ...tab,
+      badge: tab.id === "live-intercept" ? interceptedCount : tab.badge,
+    }));
+  }, [interceptedCount]);
+
+  const selectedConnection =
+    state.connections.find((connection) => connection.id === state.selectedConnectionId) ??
+    state.connections[0];
+
+  const ActivePanel =
+    tabsWithBadges.find((tab) => tab.id === activeTab)?.component ?? tabsWithBadges[0].component;
 
   return (
-    <main className="container">
-      <h1>Welcome to Tauri + React</h1>
+    <div className="app-shell">
+      <header className="app-header">
+        <div>
+          <p className="eyebrow">Proxy UI · Live mode</p>
+          <h1>Multi-mode connection explorer</h1>
+        </div>
+        <div className="app-header__stats">
+          <span className="stat-pill">{state.connections.length} connections</span>
+          <span className="stat-pill">Live intercept {state.liveInterceptEnabled ? "on" : "off"}</span>
+        </div>
+      </header>
 
-      <div className="row">
-        <a href="https://vite.dev" target="_blank">
-          <img src="/vite.svg" className="logo vite" alt="Vite logo" />
-        </a>
-        <a href="https://tauri.app" target="_blank">
-          <img src="/tauri.svg" className="logo tauri" alt="Tauri logo" />
-        </a>
-        <a href="https://react.dev" target="_blank">
-          <img src={reactLogo} className="logo react" alt="React logo" />
-        </a>
-      </div>
-      <p>Click on the Tauri, Vite, and React logos to learn more.</p>
+      <section className="selection-preview">
+        {selectedConnection ? (
+          <div className="selection-preview__card">
+            <div>
+              <p className="selection-preview__label">Focused connection</p>
+              <h2>{selectedConnection.host}</h2>
+              <p className="selection-preview__desc">
+                {selectedConnection.method} {selectedConnection.path}
+              </p>
+            </div>
+            <div className="selection-preview__badges">
+              <ConnectionStateBadge
+                state={selectedConnection.state}
+                timestamp={selectedConnection.timestamp}
+                durationMs={selectedConnection.durationMs}
+              />
+              <span className="stat-pill">{selectedConnection.protocol.toUpperCase()}</span>
+            </div>
+          </div>
+        ) : (
+          <p className="tab-panel__empty">No connection selected.</p>
+        )}
+      </section>
 
-      <form
-        className="row"
-        onSubmit={(e) => {
-          e.preventDefault();
-          greet();
-        }}
-      >
-        <input
-          id="greet-input"
-          onChange={(e) => setName(e.currentTarget.value)}
-          placeholder="Enter a name..."
-        />
-        <button type="submit">Greet</button>
-      </form>
-      <p>{greetMsg}</p>
-    </main>
+      <TabBar tabs={tabsWithBadges} activeId={activeTab} onChange={setActiveTab} />
+      <main className="panel-area">
+        <ActivePanel />
+      </main>
+    </div>
   );
-}
+};
+
+const App = () => (
+  <ConnectionProvider>
+    <AppContent />
+  </ConnectionProvider>
+);
 
 export default App;

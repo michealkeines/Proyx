@@ -57,14 +57,12 @@ Certificates are generated with `rcgen` on the fly. You can trust the CA by copy
 
 ## Frontend / UI mode
 
-- The project is now a workspace with two crates: `proxy-backend` (Rust proxy + state machine) and a Tauri UI (`src-tauri`) that runs the renderer served from `src-tauri/dist`.
-- `src-tauri/main.rs` spins up the same backend proxy, exposes tauri commands (`toggle_live_intercept`, `resume_intercept`, `replay_connection`, `get_connections`, `get_intercept_queue`), and forwards backend events (`proxy-event`) to the renderer.
-- The renderer currently mounts a tab bar, sitemap, replay, and live-intercept panels in vanilla JS/HTML/CSS located under `src-tauri/dist`.
-- The Tauri layer now mirrors the working `example-code` template: the UI crate is a library (`proyx_ui_lib`) with a thin `main.rs` shim, `build.rs` runs `tauri_build::build`, and the runtime wires up the tray/menu, plugins, and proxy state before launching the window.
-- `src-tauri/tauri.conf.json` keeps the template schema while pointing at `../dist` and the “Proyx Control Center” assets we copied from the example; icons, capability files, and the `frontendDist`/`devUrl` settings match the expected layout so the config parser succeeds.
-- Run `cargo tauri dev -p proyx-ui` from `src-tauri` (with your renderer dev server running at the `devUrl`) to build the native shell that drives the multi-tab UI described in `ui_mode_design.md`.
-- UI design notes live in `ui_mode_design.md`; follow that guide to extend tabs, shared components, and connection badges to match the described request/intercept/response states.
-- Tauri’s config file (`src-tauri/tauri.conf.json`) follows the v2 schema (`https://schema.tauri.app/config/2`) and declares the window metadata, bundle settings, and allowlist needed by the runtime.
+- The workspace includes the `proxy-backend` crate that drives the MITM machinery and the Tauri UI under `proyxui/src-tauri` that now renders a React/Vite application from `proyxui/src`.
+- `src/App.tsx` wraps the tabbed layout inside `ConnectionProvider`, which lives in `src/state/connection-store.tsx`. That store hydrates from `get_connections`/`get_intercept_queue`, listens to `proxy-event`, and normalizes backend snapshots into the data consumed by the `SiteMapTab`, `RequestReplayTab`, and `LiveInterceptTab`.
+- Each tab (`src/tabs/*`) ships focused layouts and actions that call the accompanying Tauri commands (`resume_intercept`, `drop_request`, `replay_connection`, `toggle_live_intercept`, `modify_intercept`, `drop_intercept`, etc.) through `@tauri-apps/api/core` so the UI stays in sync with backend state.
+- The Tauri backend (`proyxui/src-tauri/src/lib.rs`) now exposes the same proxy state as commands/events, forwards `ProxyEvent` via `app_handle.emit("proxy-event", …)`, and spins up the proxy server from `MitmProxy::bind` before launching the window.
+- The shell mirrors the example template: a thin `src-tauri/src/main.rs` calls `proyxui_lib::run()`, `build.rs` runs `tauri_build::build`, and `tauri.conf.json` keeps the v2 schema while pointing at the React build output.
+- Run `cargo tauri dev` from `proyxui/src-tauri` (with the React dev server on `devUrl`) to iterate, or `npm run build` from `proyxui` and then `cargo tauri build` to bundle.
 
 ## Building / running
 
@@ -74,8 +72,8 @@ Certificates are generated with `rcgen` on the fly. You can trust the CA by copy
 
 ## Open gaps & improvements
 
-1. **UI wiring** – the renderer is currently static (vanilla JS). Flesh out real JSON/TS-based components, virtualize long lists, and replace the manual DOM updates with a framework if preferred.
-2. **Intercept controls** – currently `resume_intercept` just releases requests; the plan is to add edit/resume/drop controls in the UI and persist lifecycle events (`request`, `intercept`, `response`) through the store.
-3. **Replay actions** – replay currently just resets the proxy state; integrate request editors, stored collections, and replay scheduling via additional commands/events.
-4. **Testing & tooling** – introduce unit/integration tests over the state machine, ProxyState, and tauri commands; consider harnesses for capturing live intercept scenarios.
-5. **Documentation** – keep `ui_mode_design.md` in sync with any tab/component changes, expand this README with build/run scripts for the UI toolchain you adopt, and document how the renderer consumes `proxy-event` payloads.
+1. **Live intercept controls** – the UI already surfaces Resume/Modify/Drop actions, but the backend still treats these mainly as state transitions; wire the UI payloads to real request mutations (and persist edited bodies) inside `ProxyState`.
+2. **Replay enrichment** – the replay tab mirrors stored snapshots, but payloads and response metadata are lightweight; stream more headers/bodies/duration info from `ProxyState` so the editor can faithfully replay traffic.
+3. **State metadata & filtering** – the `ConnectionStore` normalizes backend snapshots, but it could retain timestamps, tags, and session growth to drive richer filters/pagination; consider memoized selectors or virtualization for long histories.
+4. **Testing & tooling** – add unit/integration coverage for the `ConnectionStore`, tauri commands, and `ProxyEvent` wiring so UI workflows (toggle, resume, replay) stay reliable across refactors.
+5. **Documentation** – keep `ui_mode_design.md` synced with the React tabs/components, list the available Tauri invocations in this README, and capture how the renderer consumes `proxy-event` payloads for future contributors.

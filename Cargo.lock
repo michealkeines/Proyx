@@ -3363,11 +3363,14 @@ dependencies = [
 name = "proyxui"
 version = "0.1.0"
 dependencies = [
+ "Proyx",
  "serde",
  "serde_json",
  "tauri",
  "tauri-build",
  "tauri-plugin-opener",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

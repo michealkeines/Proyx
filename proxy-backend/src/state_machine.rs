@@ -1,4 +1,4 @@
-use crate::MitmProxy;
+use crate::{ConnectionState, MitmProxy};
 use http_body_util::{BodyExt, combinators::BoxBody};
 use hyper::{
     Method, Request, Response, Uri,
@@ -6,6 +6,7 @@ use hyper::{
     service::HttpService,
 };
 use std::{borrow::Borrow, pin::Pin, ptr, sync::Arc};
+use tokio::sync::oneshot;
 use tracing::info;
 
 type BoxedResponse<S> = Response<
@@ -98,6 +99,13 @@ where
                         return Ok(response);
                     }
                 },
+                State::AwaitResume(stage) => match stage.run().await? {
+                    Execution::Continue(next) => next,
+                    Execution::Ready(response) => {
+                        self.drop_connection();
+                        return Ok(response);
+                    }
+                },
                 State::WaitingIo(stage) => match stage.run().await? {
                     Execution::Continue(next) => next,
                     Execution::Ready(response) => {
@@ -161,6 +169,7 @@ where
     request: Option<Request<Incoming>>,
     response: Option<Response<<S as HttpService<Incoming>>::ResBody>>,
     metadata: Option<RequestMetadata>,
+    connection_id: Option<u64>,
 }
 
 impl<I, S> Connection<I, S>
@@ -176,6 +185,7 @@ where
             request: Some(request),
             response: None,
             metadata: None,
+            connection_id: None,
         }
     }
 }
@@ -197,6 +207,7 @@ where
 {
     Request(RequestState<I, S>),
     Intercept(InterceptState<I, S>),
+    AwaitResume(AwaitResumeState<I, S>),
     WaitingIo(WaitingIoState<I, S>),
     Response(ResponseState<I, S>),
 }
@@ -256,8 +267,24 @@ where
         let _ = Arc::as_ptr(&connection.proxy);
         info!("RequestState enter");
 
+        let request = connection
+            .request
+            .take()
+            .expect("request state populates the request");
+        let metadata = RequestMetadata {
+            method: request.method().clone(),
+            uri: request.uri().clone(),
+        };
+        connection.metadata = Some(metadata.clone());
+        let ui_state = connection.proxy.ui_state.clone();
+        let connection_id = ui_state
+            .register_connection(metadata.method.to_string(), metadata.uri.to_string())
+            .await;
+        connection.connection_id = Some(connection_id);
+
         Ok(Execution::Continue(State::Intercept(InterceptState {
             connection: self.connection,
+            request: Some(request),
         })))
     }
 }
@@ -269,6 +296,7 @@ where
     <S as HttpService<Incoming>>::ResBody: Send + Sync + 'static,
 {
     connection: *mut Connection<I, S>,
+    request: Option<Request<Incoming>>,
 }
 
 unsafe impl<I, S> Send for InterceptState<I, S>
@@ -287,23 +315,91 @@ where
 {
     async fn run(self) -> Result<Execution<I, S>, <S as HttpService<Incoming>>::Error> {
         let connection = unsafe { &mut *self.connection };
-        let request = connection
-            .request
-            .take()
-            .expect("request state populates the request");
-
-        let metadata = RequestMetadata {
-            method: request.method().clone(),
-            uri: request.uri().clone(),
-        };
-        connection.metadata = Some(metadata.clone());
+        let metadata = connection
+            .metadata
+            .as_ref()
+            .expect("request state stores metadata");
         info!("Intercepted request {} {}", metadata.method, metadata.uri);
+
+        let connection_id = connection
+            .connection_id
+            .expect("request state assigns a connection id");
+        let ui_state = connection.proxy.ui_state.clone();
+        ui_state
+            .update_state(connection_id, ConnectionState::Intercept, None)
+            .await;
+
+        let request = self
+            .request
+            .expect("Intercept state keeps the request alive until handled");
+
+        if ui_state.is_live_intercept() {
+            let resume = ui_state.wait_for_resume(connection_id).await;
+            return Ok(Execution::Continue(State::AwaitResume(AwaitResumeState {
+                connection: self.connection,
+                request: Some(request),
+                resume,
+                connection_id,
+            })));
+        }
 
         let pending = connection.service.call(request);
         let waiting = WaitingIoState {
             connection: self.connection,
             pending: Box::pin(pending),
+            connection_id,
         };
+        ui_state
+            .update_state(connection_id, ConnectionState::WaitingIo, None)
+            .await;
+
+        Ok(Execution::Continue(State::WaitingIo(waiting)))
+    }
+}
+
+struct AwaitResumeState<I, S>
+where
+    I: Send + Sync + 'static,
+    S: HttpService<Incoming>,
+    <S as HttpService<Incoming>>::ResBody: Send + Sync + 'static,
+{
+    connection: *mut Connection<I, S>,
+    request: Option<Request<Incoming>>,
+    resume: oneshot::Receiver<()>,
+    connection_id: u64,
+}
+
+unsafe impl<I, S> Send for AwaitResumeState<I, S>
+where
+    I: Send + Sync + 'static,
+    S: HttpService<Incoming>,
+    <S as HttpService<Incoming>>::ResBody: Send + Sync + 'static,
+{
+}
+
+impl<I, S> AwaitResumeState<I, S>
+where
+    I: Send + Sync + 'static,
+    S: HttpService<Incoming>,
+    <S as HttpService<Incoming>>::ResBody: Send + Sync + 'static,
+{
+    async fn run(self) -> Result<Execution<I, S>, <S as HttpService<Incoming>>::Error> {
+        let connection = unsafe { &mut *self.connection };
+        let _ = self.resume.await;
+
+        let request = self
+            .request
+            .expect("await resume state keeps the request alive");
+        let pending = connection.service.call(request);
+        let waiting = WaitingIoState {
+            connection: self.connection,
+            pending: Box::pin(pending),
+            connection_id: self.connection_id,
+        };
+        let ui_state = connection.proxy.ui_state.clone();
+        ui_state
+            .update_state(self.connection_id, ConnectionState::WaitingIo, None)
+            .await;
 
         Ok(Execution::Continue(State::WaitingIo(waiting)))
     }
@@ -317,6 +413,7 @@ where
 {
     connection: *mut Connection<I, S>,
     pending: Pin<Box<<S as HttpService<Incoming>>::Future>>,
+    connection_id: u64,
 }
 
 unsafe impl<I, S> Send for WaitingIoState<I, S>
@@ -345,6 +442,7 @@ where
 
         Ok(Execution::Continue(State::Response(ResponseState {
             connection: self.connection,
+            connection_id: self.connection_id,
         })))
     }
 }
@@ -356,6 +454,7 @@ where
     <S as HttpService<Incoming>>::ResBody: Send + Sync + 'static,
 {
     connection: *mut Connection<I, S>,
+    connection_id: u64,
 }
 
 unsafe impl<I, S> Send for ResponseState<I, S>
@@ -386,6 +485,11 @@ where
                 response.status()
             );
         }
+        let status = response.status().as_u16();
+        let ui_state = connection.proxy.ui_state.clone();
+        ui_state
+            .update_state(self.connection_id, ConnectionState::Response, Some(status))
+            .await;
         let boxed = response.map(|body| body.boxed());
 
         Ok(Execution::Ready(boxed))

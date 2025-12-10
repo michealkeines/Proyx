@@ -12,9 +12,15 @@ use tls::{CertifiedKeyDer, generate_cert};
 use tokio::net::{TcpListener, TcpStream, ToSocketAddrs};
 use tokio_rustls::rustls;
 
+pub mod config;
+mod proxy_state;
+pub use config::Config;
+pub mod ca;
+pub use ca::{load_or_create_ca, make_root_issuer};
 pub use futures;
 pub use hyper;
 pub use moka;
+pub use proxy_state::{ConnectionSnapshot, ConnectionState, ProxyEvent, ProxyState};
 
 #[cfg(feature = "native-tls-client")]
 pub use tokio_native_tls;
@@ -39,6 +45,8 @@ pub struct MitmProxy<I> {
     ///
     /// The key of cache is hostname.
     pub cert_cache: Option<Cache<String, CertifiedKeyDer>>,
+    /// Shared UI state for connections
+    pub ui_state: ProxyState,
 }
 
 impl<I> MitmProxy<I> {
@@ -47,6 +55,7 @@ impl<I> MitmProxy<I> {
         Self {
             root_issuer,
             cert_cache: cache,
+            ui_state: ProxyState::new(),
         }
     }
 }

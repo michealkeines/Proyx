@@ -341,6 +341,7 @@ where
                         }
                     }
                 }
+                strip_proxy_headers(req.headers_mut());
                 if let Err(err) = remove_authority(&mut req) {
                     tracing::error!("Failed to remove authority from URI: {}", err);
                     // Continue with the original request if URI modification fails
@@ -351,6 +352,7 @@ where
                 if req.version() != hyper::Version::HTTP_2 {
                     req.headers_mut().remove(header::HOST);
                 }
+                strip_proxy_headers(req.headers_mut());
                 sender.send_request(req).await
             }
         }
@@ -374,4 +376,14 @@ fn remove_authority<B>(req: &mut Request<B>) -> Result<(), hyper::http::uri::Inv
     parts.authority = None;
     *req.uri_mut() = Uri::from_parts(parts)?;
     Ok(())
+}
+
+fn strip_proxy_headers(headers: &mut hyper::HeaderMap) {
+    for name in [
+        header::PROXY_AUTHENTICATE,
+        header::PROXY_AUTHORIZATION,
+        header::HeaderName::from_static("proxy-connection"),
+    ] {
+        headers.remove(name);
+    }
 }

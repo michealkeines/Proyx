@@ -28,6 +28,9 @@ export interface Connection {
   bodyPreview: string;
   isWebsocket: boolean;
   wsEvents: WebSocketEvent[];
+  requestHeaders: Array<{ name: string; value: string }>;
+  responseHeaders: Array<{ name: string; value: string }>;
+  responseBodyPreview: string;
 }
 
 type SnapshotState = "request" | "intercept" | "waiting_io" | "response";
@@ -52,6 +55,7 @@ interface ConnectionSnapshotDto {
     direction: WebSocketDirection;
     payload_preview: string;
   }>;
+  response_body_preview?: string | null;
 }
 
 type ProxyEventPayload =
@@ -102,6 +106,7 @@ const normalizeSnapshot = (snapshot: ConnectionSnapshotDto): Connection => {
       direction: event.direction,
       payloadPreview: event.payload_preview,
     })) ?? [];
+  const responseBodyPreview = snapshot.response_body_preview ?? "";
 
   return {
     id: snapshot.id.toString(),
@@ -119,6 +124,9 @@ const normalizeSnapshot = (snapshot: ConnectionSnapshotDto): Connection => {
     bodyPreview: snapshot.body_preview ?? "",
     isWebsocket,
     wsEvents,
+    requestHeaders: snapshot.request_headers ?? [],
+    responseHeaders: snapshot.response_headers ?? [],
+    responseBodyPreview,
   };
 };
 

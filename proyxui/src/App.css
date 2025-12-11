@@ -212,6 +212,8 @@ body {
 
 .site-map-tree__path {
   font-weight: 600;
+  white-space: normal;
+  word-break: break-word;
 }
 
 .site-map-tree__status {
@@ -360,6 +362,60 @@ body {
 }
 
 .websocket-log__empty {
+  font-size: 0.75rem;
+  color: #64748b;
+}
+
+.request-replay__details {
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+  margin-bottom: 1rem;
+  border: 1px solid #e2e8f0;
+  border-radius: 0.75rem;
+  padding: 1rem;
+  background: #fff;
+}
+
+.request-replay__section {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.request-replay__section-label {
+  font-size: 0.85rem;
+  color: #475569;
+  margin: 0;
+}
+
+.request-replay__raw {
+  width: 100%;
+  min-height: 120px;
+  border-radius: 0.75rem;
+  border: 1px solid #cbd5f5;
+  background: #f8fafc;
+  padding: 0.75rem;
+  font-family: "IBM Plex Mono", "Courier New", monospace;
+  font-size: 0.85rem;
+  resize: vertical;
+}
+
+.header-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+}
+
+.header-list li {
+  font-size: 0.8rem;
+  color: #0f172a;
+}
+
+.header-list__empty {
   font-size: 0.75rem;
   color: #64748b;
 }

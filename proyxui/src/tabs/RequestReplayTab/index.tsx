@@ -33,6 +33,14 @@ export const RequestReplayTab = () => {
 
   const isWebsocket = selected?.isWebsocket ?? false;
 
+  const requestRaw = selected
+    ? `${selected.method} ${selected.protocol.toUpperCase()}://${selected.host}${selected.path}\n${selected.requestHeaders
+        .map((header) => `${header.name}: ${header.value}`)
+        .join("\n")}\n\n${selected.bodyPreview || ""}`
+    : "";
+
+  const responseBodyText = selected?.responseBodyPreview || "Response preview unavailable for this request.";
+
   const handleReplay = async () => {
     if (!selected || isWebsocket) return;
     dispatch({ type: "resume", payload: { id: selected.id } });
@@ -63,6 +71,19 @@ export const RequestReplayTab = () => {
       console.error("save_to_collection failed", error);
     }
   };
+
+  const renderHeaders = (headers: Array<{ name: string; value: string }>) =>
+    headers.length ? (
+      <ul className="header-list">
+        {headers.map((header, index) => (
+          <li key={`${header.name}-${index}`}>
+            <strong>{header.name}:</strong> {header.value}
+          </li>
+        ))}
+      </ul>
+    ) : (
+      <p className="header-list__empty">No headers captured for this request.</p>
+    );
 
   return (
     <section className="tab-panel request-replay-tab">
@@ -106,38 +127,53 @@ export const RequestReplayTab = () => {
                   </span>
                 </div>
               </header>
+              <section className="request-replay__details">
+                <div className="request-replay__section">
+                  <p className="request-replay__section-label">Original request</p>
+                  <textarea readOnly className="request-replay__raw" value={requestRaw.trim()} />
+                </div>
+                <details open className="request-replay__section">
+                  <summary>Request headers</summary>
+                  {renderHeaders(selected.requestHeaders)}
+                </details>
+                <details open className="request-replay__section">
+                  <summary>Response headers</summary>
+                  {renderHeaders(selected.responseHeaders)}
+                </details>
+                <div className="request-replay__section">
+                  <p className="request-replay__section-label">Response preview</p>
+                  <textarea readOnly className="request-replay__raw" value={responseBodyText} />
+                </div>
+              </section>
               {isWebsocket && (
                 <p className="websocket-note">
                   WebSocket connections bypass the intercept queue, so we only log their handshake.
                 </p>
               )}
-            <p className="replay-grid__preview">
-              {selected.bodyPreview || "Preview unavailable for this request."}
-            </p>
-            {isWebsocket && (
-              <section className="websocket-log">
-                <header className="websocket-log__header">
-                  <h3>WebSocket exchanges</h3>
-                  <span>{selected.wsEvents.length} messages</span>
-                </header>
-                <ul>
-                  {selected.wsEvents.map((event, index) => (
-                    <li key={`${event.timestampMs}-${index}`} className="websocket-log__item">
-                      <div>
-                        <span className="websocket-log__direction">{directionLabels[event.direction]}</span>
-                        <span className="websocket-log__time">{formatWsTimestamp(event.timestampMs)}</span>
-                      </div>
-                      <p className="websocket-log__payload">
-                        {event.payloadPreview || "Binary payload"}
-                      </p>
-                    </li>
-                  ))}
-                  {!selected.wsEvents.length && (
-                    <li className="websocket-log__empty">Waiting for WebSocket frames…</li>
-                  )}
-                </ul>
-              </section>
-            )}
+              {isWebsocket && (
+                <section className="websocket-log">
+                  <header className="websocket-log__header">
+                    <h3>WebSocket exchanges</h3>
+                    <span>{selected.wsEvents.length} messages</span>
+                  </header>
+                  <ul>
+                    {selected.wsEvents.map((event, index) => (
+                      <li key={`${event.timestampMs}-${index}`} className="websocket-log__item">
+                        <div>
+                          <span className="websocket-log__direction">{directionLabels[event.direction]}</span>
+                          <span className="websocket-log__time">{formatWsTimestamp(event.timestampMs)}</span>
+                        </div>
+                        <p className="websocket-log__payload">
+                          {event.payloadPreview || "Binary payload"}
+                        </p>
+                      </li>
+                    ))}
+                    {!selected.wsEvents.length && (
+                      <li className="websocket-log__empty">Waiting for WebSocket frames…</li>
+                    )}
+                  </ul>
+                </section>
+              )}
               <textarea
                 value={payload}
                 onChange={(event) => setPayload(event.currentTarget.value)}

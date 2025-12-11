@@ -88,6 +88,7 @@ pub struct ConnectionSnapshot {
     pub request_size: Option<u64>,
     pub response_size: Option<u64>,
     pub body_preview: Option<String>,
+    pub response_body_preview: Option<String>,
     pub ws_events: Vec<WebSocketEvent>,
     pub is_websocket: bool,
 }
@@ -166,6 +167,7 @@ impl ProxyState {
             request_size: None,
             response_size: None,
             body_preview: None,
+            response_body_preview: None,
             is_websocket,
             ws_events: Vec::new(),
         };

@@ -29,6 +29,13 @@ interface ConnectionSnapshotDto {
   state: SnapshotState;
   queued_at: number | string;
   status_code: number | null;
+  tags?: string[];
+  duration_ms?: number | null;
+  request_headers?: Array<{ name: string; value: string }>;
+  response_headers?: Array<{ name: string; value: string }>;
+  request_size?: number | null;
+  response_size?: number | null;
+  body_preview?: string | null;
 }
 
 type ProxyEventPayload =
@@ -82,11 +89,11 @@ const normalizeSnapshot = (snapshot: ConnectionSnapshotDto): Connection => {
     protocol,
     state: mapSnapshotState(snapshot.state),
     timestamp,
-    durationMs: 0,
-    requestSize: 0,
-    responseSize: 0,
-    tags: [],
-    bodyPreview: "",
+    durationMs: snapshot.duration_ms ?? 0,
+    requestSize: snapshot.request_size ?? 0,
+    responseSize: snapshot.response_size ?? 0,
+    tags: snapshot.tags ?? [],
+    bodyPreview: snapshot.body_preview ?? "",
   };
 };
 

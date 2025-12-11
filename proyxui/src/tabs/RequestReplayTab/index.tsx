@@ -39,10 +39,15 @@ export const RequestReplayTab = () => {
     }
   };
 
-  const handleSave = () => {
+  const handleSave = async () => {
     if (!selected) return;
     dispatch({ type: "modify", payload: { id: selected.id, preview: payload } });
-    console.log("Saved replay payload for", selected.id);
+    try {
+      await invoke("save_to_collection", { id: Number(selected.id) });
+      console.log("Saved replay payload for", selected.id);
+    } catch (error) {
+      console.error("save_to_collection failed", error);
+    }
   };
 
   return (
@@ -79,8 +84,17 @@ export const RequestReplayTab = () => {
                 <div className="replay-grid__meta">
                   <span>{selected.host}</span>
                   <span>Status {selected.status}</span>
+                  <span>
+                    Request{" "}
+                    {selected.requestSize
+                      ? `${selected.requestSize.toLocaleString()} B`
+                      : "size unknown"}
+                  </span>
                 </div>
               </header>
+              <p className="replay-grid__preview">
+                {selected.bodyPreview || "Preview unavailable for this request."}
+              </p>
               <textarea
                 value={payload}
                 onChange={(event) => setPayload(event.currentTarget.value)}

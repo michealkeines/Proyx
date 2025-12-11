@@ -101,7 +101,17 @@ export const LiveInterceptTab = () => {
                       {connection.method} {connection.path}
                     </p>
                     <p className="live-queue__meta">
-                      {connection.tags.join(" · ")} · {connection.protocol.toUpperCase()}
+                      {(connection.tags.length ? connection.tags.join(" · ") : "No tags")} ·{" "}
+                      {connection.protocol.toUpperCase()}
+                    </p>
+                    {connection.bodyPreview && (
+                      <p className="live-queue__preview">{connection.bodyPreview}</p>
+                    )}
+                    <p className="live-queue__meta">
+                      Request{" "}
+                      {connection.requestSize
+                        ? `${connection.requestSize.toLocaleString()} B`
+                        : "unknown size"}
                     </p>
                   </div>
                   <div className="live-queue__actions">

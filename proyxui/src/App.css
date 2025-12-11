@@ -319,6 +319,13 @@ body {
   color: #94a3b8;
 }
 
+.replay-grid__preview {
+  margin: 0;
+  font-size: 0.85rem;
+  color: #475569;
+  min-height: 1.4rem;
+}
+
 .replay-grid__editor {
   background: #f8fafc;
   border-radius: 1rem;
@@ -431,6 +438,12 @@ body {
   margin: 0;
   font-size: 0.8rem;
   color: #64748b;
+}
+
+.live-queue__preview {
+  margin: 0.25rem 0 0;
+  font-size: 0.85rem;
+  color: #475569;
 }
 
 .live-queue__actions {

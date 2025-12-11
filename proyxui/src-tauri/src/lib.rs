@@ -1,4 +1,9 @@
-use std::{env, error::Error as StdError, net::SocketAddr, path::Path};
+use std::{
+    env,
+    error::Error as StdError,
+    net::SocketAddr,
+    path::{Path, PathBuf},
+};
 
 use tauri::{async_runtime, Emitter, Manager, State};
 use tracing_subscriber::EnvFilter;
@@ -64,22 +69,25 @@ async fn drop_request(state: State<'_, AppState>, id: u64) -> Result<bool, Strin
 
 #[tauri::command]
 async fn modify_intercept(
-    _state: State<'_, AppState>,
+    state: State<'_, AppState>,
     id: u64,
     preview: String,
 ) -> Result<bool, String> {
     tracing::info!(
-        "Modifying intercept {id} with {} bytes (not yet replayed)",
+        "Modifying intercept {id} with {} bytes (queued for replay)",
         preview.len()
     );
-    let _ = (_state, id, preview);
+    state
+        .proxy_state
+        .queue_intercept_modification(id, preview)
+        .await;
     Ok(true)
 }
 
 #[tauri::command]
 async fn drop_intercept(state: State<'_, AppState>, id: u64) -> Result<bool, String> {
     tracing::info!("Dropping intercept {id}");
-    Ok(state.proxy_state.resume_intercept(id).await)
+    Ok(state.proxy_state.drop_intercept(id).await)
 }
 
 #[tauri::command]
@@ -88,9 +96,31 @@ fn save_to_collection(id: u64) -> bool {
     true
 }
 
+fn detect_config_path() -> PathBuf {
+    if let Ok(env_path) = env::var("PROXY_CONFIG") {
+        return PathBuf::from(env_path);
+    }
+
+    let mut current = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    loop {
+        let candidate = current.join("proxy-config.toml");
+        if candidate.exists() {
+            return candidate;
+        }
+        if let Some(parent) = current.parent() {
+            current = parent.to_path_buf();
+        } else {
+            break;
+        }
+    }
+
+    PathBuf::from("proxy-config.toml")
+}
+
 pub fn run() -> Result<(), Box<dyn StdError>> {
     let context = tauri::generate_context!();
-    let config_path = env::var("PROXY_CONFIG").unwrap_or_else(|_| "proxy-config.toml".into());
+    let config_path = detect_config_path();
+    tracing::info!("Loading configuration from {}", config_path.display());
     let config = Config::load(Path::new(&config_path))?;
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::new(&config.log_level))

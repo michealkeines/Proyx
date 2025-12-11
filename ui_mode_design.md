@@ -20,6 +20,21 @@ React/Vite renderer that sits behind the Tauri shell.
   the directory tree and normalizing `ca_dir` relative to that file so the CA artifacts are reused
   even when the UI or CLI launches from different working directories.
 
+## Proxyman-Inspired UI Notes
+
+- **Window chrome + hero**: The reference experience layers the brand plate inside the window (with a circle orb, Proxyman logo/pill, and listening status) and exposes key actions (Pause/Notes/Clear) inside the same horizontal card.
+- **Status chips**: Immediately beneath the hero there is a row of pills summarizing connection counts, queue sizes, and live intercept status. These chips reinforce the top-level health of the proxy.
+- **Traffic filters**: The UI surfaces a secondary chip row for traffic types (All/HTTP/HTTPS/WebSocket/JSON/etc.) with a flush pill design and a distinct active highlight.
+- **Sidebar**: The left column keeps Favorites, Protocol overview, and Live highlight cards stacked vertically. Favorites show host names, counts, and mini-state badges that the user can jump to. Protocol overview is a condensed tally, and Live highlight mirrors the focused host.
+- **Main panel**: The focus area combines a dark “Focused connection” card at the top with method/host details, followed by the tab strip and the currently active panel blending into a white card container. Connections below in Site Map/List view mirror the row-style items with status badges and action buttons.
+- **Branding update**: This shell needs to reflect the “Proyx” name instead of Proxyman while preserving the listening/traffic story and tight layout.
+
+## Next steps for redesign
+
+1. Replace the current header/tab scaffolding with the hero + chip structure described above and stamp the entire chrome with the Proyx brand, including the palette, badges, and card hierarchy.
+2. Re-architect `App.tsx` so the left column provides Favorites/Protocols/Live highlight while the right column hosts the Focused connection, tab row, and active panel.
+3. Refresh `App.css` to match the heavy gradients, rounded cards, and smooth hover/active states from the reference, without breaking the existing tab content styles.
+
 ## Tab Layout
 
 1. **Site Map Tab**

@@ -7,6 +7,26 @@ use std::sync::{
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::{Mutex, broadcast, oneshot};
 
+#[derive(Clone, Copy)]
+pub struct ConnectionContext {
+    pub id: u64,
+    pub is_websocket: bool,
+}
+
+#[derive(Clone, Serialize)]
+pub struct WebSocketEvent {
+    pub timestamp_ms: u64,
+    pub direction: WebSocketDirection,
+    pub payload_preview: String,
+}
+
+#[derive(Clone, Copy, Serialize, Debug)]
+#[serde(rename_all = "snake_case")]
+pub enum WebSocketDirection {
+    ClientToServer,
+    ServerToClient,
+}
+
 #[derive(Clone)]
 pub struct ProxyState {
     inner: Arc<ProxyStateInner>,
@@ -68,6 +88,8 @@ pub struct ConnectionSnapshot {
     pub request_size: Option<u64>,
     pub response_size: Option<u64>,
     pub body_preview: Option<String>,
+    pub ws_events: Vec<WebSocketEvent>,
+    pub is_websocket: bool,
 }
 
 #[derive(Clone, Copy, Serialize, PartialEq)]
@@ -123,7 +145,12 @@ impl ProxyState {
             .send(ProxyEvent::LiveInterceptToggled { enabled });
     }
 
-    pub async fn register_connection(&self, method: String, uri: String) -> u64 {
+    pub async fn register_connection(
+        &self,
+        method: String,
+        uri: String,
+        is_websocket: bool,
+    ) -> u64 {
         let id = self.inner.next_id.fetch_add(1, Ordering::Relaxed);
         let snapshot = ConnectionSnapshot {
             id,
@@ -139,6 +166,8 @@ impl ProxyState {
             request_size: None,
             response_size: None,
             body_preview: None,
+            is_websocket,
+            ws_events: Vec::new(),
         };
         let mut sessions = self.inner.sessions.lock().await;
         sessions.insert(id, snapshot.clone());
@@ -193,6 +222,19 @@ impl ProxyState {
                 .duration_ms
                 .unwrap_or_else(|| now.saturating_sub(queued_at));
             snapshot.duration_ms = Some(duration);
+            let cloned = snapshot.clone();
+            drop(sessions);
+            let _ = self
+                .inner
+                .event_tx
+                .send(ProxyEvent::ConnectionUpdated(cloned));
+        }
+    }
+
+    pub async fn append_websocket_event(&self, id: u64, event: WebSocketEvent) {
+        let mut sessions = self.inner.sessions.lock().await;
+        if let Some(snapshot) = sessions.get_mut(&id) {
+            snapshot.ws_events.push(event.clone());
             let cloned = snapshot.clone();
             drop(sessions);
             let _ = self

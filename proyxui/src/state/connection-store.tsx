@@ -4,6 +4,14 @@ import { listen, UnlistenFn } from "@tauri-apps/api/event";
 
 export type ConnectionStateKind = "request" | "intercept" | "response";
 
+export type WebSocketDirection = "client_to_server" | "server_to_client";
+
+export interface WebSocketEvent {
+  timestampMs: number;
+  direction: WebSocketDirection;
+  payloadPreview: string;
+}
+
 export interface Connection {
   id: string;
   host: string;
@@ -18,6 +26,8 @@ export interface Connection {
   responseSize: number;
   tags: string[];
   bodyPreview: string;
+  isWebsocket: boolean;
+  wsEvents: WebSocketEvent[];
 }
 
 type SnapshotState = "request" | "intercept" | "waiting_io" | "response";
@@ -36,6 +46,12 @@ interface ConnectionSnapshotDto {
   request_size?: number | null;
   response_size?: number | null;
   body_preview?: string | null;
+  is_websocket?: boolean;
+  ws_events?: Array<{
+    timestamp_ms: number;
+    direction: WebSocketDirection;
+    payload_preview: string;
+  }>;
 }
 
 type ProxyEventPayload =
@@ -79,6 +95,13 @@ const normalizeSnapshot = (snapshot: ConnectionSnapshotDto): Connection => {
   }
 
   const timestamp = Number.isFinite(queuedAt) && queuedAt > 0 ? formatTimestamp(queuedAt) : "";
+  const isWebsocket = snapshot.is_websocket ?? false;
+  const wsEvents =
+    snapshot.ws_events?.map((event) => ({
+      timestampMs: event.timestamp_ms,
+      direction: event.direction,
+      payloadPreview: event.payload_preview,
+    })) ?? [];
 
   return {
     id: snapshot.id.toString(),
@@ -94,6 +117,8 @@ const normalizeSnapshot = (snapshot: ConnectionSnapshotDto): Connection => {
     responseSize: snapshot.response_size ?? 0,
     tags: snapshot.tags ?? [],
     bodyPreview: snapshot.body_preview ?? "",
+    isWebsocket,
+    wsEvents,
   };
 };
 

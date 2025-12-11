@@ -20,7 +20,10 @@ pub use ca::{load_or_create_ca, make_root_issuer};
 pub use futures;
 pub use hyper;
 pub use moka;
-pub use proxy_state::{ConnectionSnapshot, ConnectionState, ProxyEvent, ProxyState};
+pub use proxy_state::{
+    ConnectionContext, ConnectionSnapshot, ConnectionState, ProxyEvent, ProxyState,
+    WebSocketDirection, WebSocketEvent,
+};
 
 #[cfg(feature = "native-tls-client")]
 pub use tokio_native_tls;

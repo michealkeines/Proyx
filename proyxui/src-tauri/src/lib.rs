@@ -3,16 +3,19 @@ use std::{
     error::Error as StdError,
     net::SocketAddr,
     path::{Path, PathBuf},
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use tauri::{async_runtime, Emitter, Manager, State};
 use tracing_subscriber::EnvFilter;
 
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use Proyx::hyper::{body::Incoming, service::service_fn, Request};
 use Proyx::moka::sync::Cache;
 use Proyx::{
-    default_client::{DefaultClient, Error as DefaultClientError},
-    load_or_create_ca, Config, ConnectionSnapshot, MitmProxy, ProxyState,
+    default_client::{DefaultClient, Error as DefaultClientError, Upgraded},
+    load_or_create_ca, Config, ConnectionContext, ConnectionSnapshot, MitmProxy, ProxyState,
+    WebSocketDirection, WebSocketEvent,
 };
 
 #[derive(Clone)]
@@ -138,7 +141,7 @@ pub fn run() -> Result<(), Box<dyn StdError>> {
     let proxy = MitmProxy::new(Some(root_issuer), Some(Cache::new(config.cache_capacity)));
     let proxy_state = proxy.ui_state.clone();
     let server_addr: SocketAddr = config.address.parse()?;
-    let client = DefaultClient::new();
+    let client = DefaultClient::new().with_upgrades();
 
     let app_state = AppState {
         proxy_state: proxy_state.clone(),
@@ -166,14 +169,38 @@ pub fn run() -> Result<(), Box<dyn StdError>> {
             let addr = server_addr;
             let proxy = proxy;
 
+            let service_state = emit_state.clone();
             async_runtime::spawn(async move {
                 let service = service_fn(move |req: Request<Incoming>| {
                     let client = client.clone();
+                    let proxy_state = service_state.clone();
                     async move {
+                        let connection_context =
+                            req.extensions().get::<ConnectionContext>().copied();
                         let (response, upgrade) = client.send_request(req).await?;
                         if let Some(handle) = upgrade {
+                            let proxy_state = proxy_state.clone();
                             async_runtime::spawn(async move {
-                                let _ = handle.await;
+                                match handle.await {
+                                    Ok(Ok(upgraded)) => {
+                                        if let Some(context) = connection_context {
+                                            log_websocket_connection(
+                                                proxy_state,
+                                                context,
+                                                upgraded,
+                                            )
+                                            .await;
+                                        } else {
+                                            drain_upgraded(upgraded).await;
+                                        }
+                                    }
+                                    Ok(Err(err)) => {
+                                        tracing::warn!("WebSocket relay failed: {}", err);
+                                    }
+                                    Err(err) => {
+                                        tracing::warn!("WebSocket upgrade join failed: {}", err);
+                                    }
+                                }
                             });
                         }
                         Ok::<_, DefaultClientError>(response)
@@ -205,4 +232,86 @@ pub fn run() -> Result<(), Box<dyn StdError>> {
         .run(context)?;
 
     Ok(())
+}
+
+async fn log_websocket_connection(
+    proxy_state: ProxyState,
+    context: ConnectionContext,
+    upgraded: Upgraded,
+) {
+    let (client_reader, client_writer) = tokio::io::split(upgraded.client);
+    let (server_reader, server_writer) = tokio::io::split(upgraded.server);
+
+    let c2s = relay_with_logging(
+        client_reader,
+        server_writer,
+        WebSocketDirection::ClientToServer,
+        proxy_state.clone(),
+        context,
+    );
+    let s2c = relay_with_logging(
+        server_reader,
+        client_writer,
+        WebSocketDirection::ServerToClient,
+        proxy_state,
+        context,
+    );
+    let _ = tokio::join!(c2s, s2c);
+}
+
+async fn relay_with_logging<R, W>(
+    mut reader: R,
+    mut writer: W,
+    direction: WebSocketDirection,
+    proxy_state: ProxyState,
+    context: ConnectionContext,
+) where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let mut buffer = [0u8; 4096];
+
+    loop {
+        match reader.read(&mut buffer).await {
+            Ok(0) => break,
+            Ok(size) => {
+                if writer.write_all(&buffer[..size]).await.is_err() {
+                    break;
+                }
+
+                let event = WebSocketEvent {
+                    timestamp_ms: current_millis(),
+                    direction,
+                    payload_preview: summarize_payload(&buffer[..size]),
+                };
+                proxy_state.append_websocket_event(context.id, event).await;
+            }
+            Err(err) => {
+                tracing::warn!("WebSocket relay error ({:?}): {}", direction, err);
+                break;
+            }
+        }
+    }
+
+    let _ = writer.shutdown().await;
+}
+
+async fn drain_upgraded(mut upgraded: Upgraded) {
+    let _ = tokio::io::copy_bidirectional(&mut upgraded.client, &mut upgraded.server).await;
+}
+
+fn summarize_payload(data: &[u8]) -> String {
+    let mut payload = String::from_utf8_lossy(data).to_string();
+    if payload.len() > 1024 {
+        payload.truncate(1024);
+        payload.push('…');
+    }
+    payload
+}
+
+fn current_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|dur| dur.as_millis() as u64)
+        .unwrap_or_default()
 }

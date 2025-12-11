@@ -1,12 +1,14 @@
 use crate::{
     ConnectionState, MitmProxy,
-    proxy_state::{HeaderEntry, InterceptDecision, RequestDetails, ResponseDetails},
+    proxy_state::{
+        ConnectionContext, HeaderEntry, InterceptDecision, RequestDetails, ResponseDetails,
+    },
 };
 use http_body_util::{BodyExt, Empty, combinators::BoxBody};
 use hyper::{
     Method, Request, Response, StatusCode, Uri,
     body::{Body, Incoming},
-    header::{CONTENT_LENGTH, CONTENT_TYPE, HeaderMap, HeaderName},
+    header::{CONTENT_LENGTH, CONTENT_TYPE, HeaderMap, HeaderName, UPGRADE},
     service::HttpService,
 };
 use std::{borrow::Borrow, pin::Pin, ptr, sync::Arc};
@@ -161,6 +163,7 @@ struct RequestMetadata {
     method: Method,
     uri: Uri,
     headers: HeaderMap,
+    is_websocket: bool,
 }
 
 fn header_entries(headers: &HeaderMap) -> Vec<HeaderEntry> {
@@ -188,6 +191,9 @@ fn build_request_tags(metadata: &RequestMetadata) -> Vec<String> {
     if let Some(scheme) = metadata.uri.scheme_str() {
         tags.push(scheme.to_string());
     }
+    if metadata.is_websocket {
+        tags.push("websocket".to_string());
+    }
     tags
 }
 
@@ -206,6 +212,28 @@ fn build_body_preview(metadata: &RequestMetadata, request_size: Option<u64>) -> 
     (!parts.is_empty()).then(|| parts.join(" · "))
 }
 
+fn websocket_upgrade_value(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get(UPGRADE)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_string())
+}
+
+fn is_websocket_upgrade(value: &str) -> bool {
+    value.to_ascii_lowercase().contains("websocket")
+}
+
+fn has_websocket_upgrade(headers: &HeaderMap) -> (bool, Option<String>) {
+    let upgrade_value = websocket_upgrade_value(headers);
+    let is_websocket = upgrade_value
+        .as_deref()
+        .map(is_websocket_upgrade)
+        .unwrap_or(false);
+    (is_websocket, upgrade_value)
+}
+
 struct Connection<I, S>
 where
     I: Send + Sync + 'static,
@@ -218,6 +246,7 @@ where
     response: Option<Response<<S as HttpService<Incoming>>::ResBody>>,
     metadata: Option<RequestMetadata>,
     connection_id: Option<u64>,
+    is_websocket: bool,
 }
 
 impl<I, S> Connection<I, S>
@@ -234,6 +263,7 @@ where
             response: None,
             metadata: None,
             connection_id: None,
+            is_websocket: false,
         }
     }
 }
@@ -315,21 +345,40 @@ where
         let _ = Arc::as_ptr(&connection.proxy);
         info!("RequestState enter");
 
-        let request = connection
+        let mut request = connection
             .request
             .take()
             .expect("request state populates the request");
+        let (is_websocket, upgrade_value) = has_websocket_upgrade(request.headers());
+        connection.is_websocket = is_websocket;
         let metadata = RequestMetadata {
             method: request.method().clone(),
             uri: request.uri().clone(),
             headers: request.headers().clone(),
+            is_websocket,
         };
+        if is_websocket {
+            info!(
+                "Observed websocket handshake {} {} (upgrade: {})",
+                metadata.method,
+                metadata.uri,
+                upgrade_value.unwrap_or_else(|| "unknown upgrade value".to_string())
+            );
+        }
         connection.metadata = Some(metadata.clone());
         let ui_state = connection.proxy.ui_state.clone();
         let connection_id = ui_state
-            .register_connection(metadata.method.to_string(), metadata.uri.to_string())
+            .register_connection(
+                metadata.method.to_string(),
+                metadata.uri.to_string(),
+                metadata.is_websocket,
+            )
             .await;
         connection.connection_id = Some(connection_id);
+        request.extensions_mut().insert(ConnectionContext {
+            id: connection_id,
+            is_websocket,
+        });
         let request_size = header_value_u64(&metadata.headers, &CONTENT_LENGTH);
         ui_state
             .update_request_details(
@@ -386,13 +435,30 @@ where
             .connection_id
             .expect("request state assigns a connection id");
         let ui_state = connection.proxy.ui_state.clone();
-        ui_state
-            .update_state(connection_id, ConnectionState::Intercept, None)
-            .await;
+        let next_state = if connection.is_websocket {
+            ConnectionState::WaitingIo
+        } else {
+            ConnectionState::Intercept
+        };
+        ui_state.update_state(connection_id, next_state, None).await;
 
         let request = self
             .request
             .expect("Intercept state keeps the request alive until handled");
+
+        if connection.is_websocket {
+            info!(
+                "Passing through websocket connection {} {}",
+                metadata.method, metadata.uri
+            );
+            let pending = connection.service.call(request);
+            let waiting = WaitingIoState {
+                connection: self.connection,
+                pending: Box::pin(pending),
+                connection_id,
+            };
+            return Ok(Execution::Continue(State::WaitingIo(waiting)));
+        }
 
         if ui_state.is_live_intercept() {
             let resume = ui_state.wait_for_resume(connection_id).await;

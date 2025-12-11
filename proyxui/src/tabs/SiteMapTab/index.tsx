@@ -2,7 +2,7 @@ import { useMemo, useState } from "react";
 import { ConnectionStateBadge } from "../../components/ConnectionStateBadge";
 import { Connection, ConnectionStateKind, useConnectionStore } from "../../state/connection-store";
 
-const protocolOptions: Array<"all" | "http" | "https"> = ["all", "http", "https"];
+const protocolOptions: Array<"all" | "http" | "https" | "websocket"> = ["all", "http", "https", "websocket"];
 const stateOptions: Array<"all" | ConnectionStateKind> = ["all", "request", "intercept", "response"];
 
 export const SiteMapTab = () => {
@@ -13,7 +13,10 @@ export const SiteMapTab = () => {
   const filteredConnections = useMemo(() => {
     return state.connections.filter((connection) => {
       const matchesProtocol =
-        protocolFilter === "all" || connection.protocol === protocolFilter;
+        protocolFilter === "all" ||
+        (protocolFilter === "websocket"
+          ? connection.isWebsocket
+          : connection.protocol === protocolFilter);
       const matchesState =
         stateFilter === "all" || connection.state === stateFilter;
       return matchesProtocol && matchesState;
@@ -88,6 +91,7 @@ export const SiteMapTab = () => {
                     <div className="site-map-tree__meta">
                       <span>{connection.protocol.toUpperCase()}</span>
                       <span className="site-map-tree__tags">{connection.tags.join(" · ")}</span>
+                      {connection.isWebsocket && <span className="site-map-tree__ws-tag">WebSocket</span>}
                     </div>
                   </div>
                   <button

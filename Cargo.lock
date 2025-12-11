@@ -3369,6 +3369,7 @@ dependencies = [
  "tauri",
  "tauri-build",
  "tauri-plugin-opener",
+ "tokio",
  "tracing",
  "tracing-subscriber",
 ]

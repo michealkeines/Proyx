@@ -3,6 +3,18 @@ import { invoke } from "@tauri-apps/api/core";
 import { ConnectionStateBadge } from "../../components/ConnectionStateBadge";
 import { useConnectionStore } from "../../state/connection-store";
 
+const directionLabels = {
+  client_to_server: "Client → Server",
+  server_to_client: "Server → Client",
+} as const;
+
+const formatWsTimestamp = (timestampMs: number) =>
+  new Date(timestampMs).toLocaleTimeString([], {
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+  });
+
 export const RequestReplayTab = () => {
   const { state, dispatch } = useConnectionStore();
   const [payload, setPayload] = useState("");
@@ -19,8 +31,10 @@ export const RequestReplayTab = () => {
     }
   }, [selected?.id]);
 
+  const isWebsocket = selected?.isWebsocket ?? false;
+
   const handleReplay = async () => {
-    if (!selected) return;
+    if (!selected || isWebsocket) return;
     dispatch({ type: "resume", payload: { id: selected.id } });
     try {
       await invoke("replay_connection", { id: selected.id, payload });
@@ -30,7 +44,7 @@ export const RequestReplayTab = () => {
   };
 
   const handleDrop = async () => {
-    if (!selected) return;
+    if (!selected || isWebsocket) return;
     dispatch({ type: "drop", payload: { id: selected.id } });
     try {
       await invoke("drop_request", { id: selected.id });
@@ -40,7 +54,7 @@ export const RequestReplayTab = () => {
   };
 
   const handleSave = async () => {
-    if (!selected) return;
+    if (!selected || isWebsocket) return;
     dispatch({ type: "modify", payload: { id: selected.id, preview: payload } });
     try {
       await invoke("save_to_collection", { id: Number(selected.id) });
@@ -92,9 +106,38 @@ export const RequestReplayTab = () => {
                   </span>
                 </div>
               </header>
-              <p className="replay-grid__preview">
-                {selected.bodyPreview || "Preview unavailable for this request."}
-              </p>
+              {isWebsocket && (
+                <p className="websocket-note">
+                  WebSocket connections bypass the intercept queue, so we only log their handshake.
+                </p>
+              )}
+            <p className="replay-grid__preview">
+              {selected.bodyPreview || "Preview unavailable for this request."}
+            </p>
+            {isWebsocket && (
+              <section className="websocket-log">
+                <header className="websocket-log__header">
+                  <h3>WebSocket exchanges</h3>
+                  <span>{selected.wsEvents.length} messages</span>
+                </header>
+                <ul>
+                  {selected.wsEvents.map((event, index) => (
+                    <li key={`${event.timestampMs}-${index}`} className="websocket-log__item">
+                      <div>
+                        <span className="websocket-log__direction">{directionLabels[event.direction]}</span>
+                        <span className="websocket-log__time">{formatWsTimestamp(event.timestampMs)}</span>
+                      </div>
+                      <p className="websocket-log__payload">
+                        {event.payloadPreview || "Binary payload"}
+                      </p>
+                    </li>
+                  ))}
+                  {!selected.wsEvents.length && (
+                    <li className="websocket-log__empty">Waiting for WebSocket frames…</li>
+                  )}
+                </ul>
+              </section>
+            )}
               <textarea
                 value={payload}
                 onChange={(event) => setPayload(event.currentTarget.value)}
@@ -102,13 +145,13 @@ export const RequestReplayTab = () => {
                 rows={8}
               />
               <div className="action-row">
-                <button type="button" onClick={handleReplay}>
+                <button type="button" onClick={handleReplay} disabled={isWebsocket}>
                   Replay request
                 </button>
-                <button type="button" className="ghost-btn" onClick={handleDrop}>
+                <button type="button" className="ghost-btn" onClick={handleDrop} disabled={isWebsocket}>
                   Drop request
                 </button>
-                <button type="button" className="ghost-btn" onClick={handleSave}>
+                <button type="button" className="ghost-btn" onClick={handleSave} disabled={isWebsocket}>
                   Save to collection
                 </button>
               </div>

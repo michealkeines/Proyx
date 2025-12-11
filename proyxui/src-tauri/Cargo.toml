@@ -25,3 +25,4 @@ serde_json = "1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 Proyx = { path = "../../proxy-backend" }
 tracing = "0.1.40"
+tokio = { version = "1.44", features = ["rt", "macros", "io-util"] }

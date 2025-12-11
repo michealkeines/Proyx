@@ -229,6 +229,15 @@ body {
 .site-map-tree__tags {
   color: #0f172a;
 }
+.site-map-tree__ws-tag {
+  border: 1px solid #a855f7;
+  background: #faf5ff;
+  color: #7c3aed;
+  border-radius: 999px;
+  padding: 0.15rem 0.65rem;
+  font-size: 0.65rem;
+  text-transform: uppercase;
+}
 
 .ghost-btn {
   border: 1px solid #cbd5f5;
@@ -293,6 +302,66 @@ body {
   display: flex;
   flex-direction: column;
   gap: 0.5rem;
+}
+
+.websocket-note {
+  margin: 0.5rem 0 1rem;
+  font-size: 0.85rem;
+  color: #7c2d12;
+  background: #fff7ed;
+  border: 1px solid #fbbf24;
+  border-radius: 0.75rem;
+  padding: 0.6rem 0.9rem;
+}
+
+.websocket-log {
+  margin-top: 1rem;
+  border-radius: 0.75rem;
+  border: 1px solid #e0e7ff;
+  background: #f8fafc;
+  padding: 1rem;
+}
+
+.websocket-log__header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  font-size: 0.85rem;
+  color: #475569;
+  margin-bottom: 0.75rem;
+}
+
+.websocket-log__item {
+  padding: 0.5rem 0;
+  border-bottom: 1px solid #e2e8f0;
+}
+
+.websocket-log__item:last-child {
+  border-bottom: none;
+}
+
+.websocket-log__direction {
+  font-size: 0.75rem;
+  font-weight: 600;
+  color: #4338ca;
+  margin-right: 0.5rem;
+}
+
+.websocket-log__time {
+  font-size: 0.75rem;
+  color: #94a3b8;
+}
+
+.websocket-log__payload {
+  margin: 0.35rem 0 0;
+  font-size: 0.8rem;
+  white-space: pre-wrap;
+  color: #0f172a;
+}
+
+.websocket-log__empty {
+  font-size: 0.75rem;
+  color: #64748b;
 }
 
 .replay-grid__item {

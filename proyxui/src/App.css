@@ -81,6 +81,12 @@ body {
   color: #475569;
 }
 
+.selection-preview__card h2,
+.selection-preview__desc {
+  word-break: break-word;
+  overflow-wrap: anywhere;
+}
+
 .selection-preview__badges {
   display: flex;
   gap: 0.5rem;
@@ -311,6 +317,8 @@ body {
 .replay-grid__title {
   margin: 0;
   font-weight: 600;
+  word-break: break-word;
+  overflow-wrap: anywhere;
 }
 
 .replay-grid__sub {
@@ -324,6 +332,11 @@ body {
   font-size: 0.85rem;
   color: #475569;
   min-height: 1.4rem;
+}
+
+.replay-grid__header h3 {
+  word-break: break-word;
+  overflow-wrap: anywhere;
 }
 
 .replay-grid__editor {
@@ -432,12 +445,15 @@ body {
 .live-queue__path {
   margin: 0.3rem 0 0;
   font-weight: 600;
+  word-break: break-word;
+  overflow-wrap: anywhere;
 }
 
 .live-queue__meta {
   margin: 0;
   font-size: 0.8rem;
   color: #64748b;
+  white-space: normal;
 }
 
 .live-queue__preview {

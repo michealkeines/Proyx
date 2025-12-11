@@ -16,6 +16,9 @@ React/Vite renderer that sits behind the Tauri shell.
 - **Modularity**: Tabs live under `src/tabs/*` and are registered via `src/tabs/descriptors.ts`.
   Each tab owns its layout and actions while shared helpers like `ConnectionStateBadge` capture
   the request/intercept/response status indicators.
+- **Config discovery**: Both the CLI proxy and the Tauri shell now resolve `proxy-config.toml` by walking
+  the directory tree and normalizing `ca_dir` relative to that file so the CA artifacts are reused
+  even when the UI or CLI launches from different working directories.
 
 ## Tab Layout
 
@@ -45,6 +48,8 @@ Each connection snapshot from the backend is normalized to `Connection` (see `co
 - `intercept` entries have been marked by the proxy and show up in the Live Intercept queue.
 - `response` indicates the downstream client has finished and the response metadata is available.
 
+The state now also carries richer metadata (`duration_ms`, `request_size`, `response_size`, `tags`, and `body_preview`) plus headers so downstream tabs can render preview text, size indicators, and badges without needing to poll the proxy again.
+
 The `ConnectionStateBadge` component renders the current state, timestamp, and summary (read/write sizes are placeholders until richer metadata is pumped through).
 
 ## Modularity & Scalability
@@ -61,11 +66,5 @@ The `ConnectionStateBadge` component renders the current state, timestamp, and s
 - `ConnectionProvider` wraps the app, keeps the reducer, and wires to Tauri via `invoke`/`listen`.
 - Each tab takes dependencies from `useConnectionStore` and issues commands through the store's actions + `invoke` wrappers.
 - The Tauri backend (in `proyxui/src-tauri/src/lib.rs`) manages the proxy state, proxies commands to `ProxyState`, and emits `proxy-event` updates when snapshots change.
-
-## Next Steps
-
-1. Pump additional metadata through `ProxyState` (headers, durations, body previews) so the reducer can surface more informative badges and filters.
-2. Let `modify_intercept`/`drop_intercept` mutate the actual waiting requests instead of just logging the payload size, and preserve modified bodies inside the store.
-3. Add replay helpers that persist collections, allow scheduling, or pre-populate request editors for later use.
-4. Introduce integration tests for the Tauri commands/event stream plus renderer tests that assert each tab issues the correct `invoke` calls.
-5. Keep this document aligned with the React renderer and `README.md` so future contributors understand how the UI consumes the backend.
+- Metadata is richer: each `ConnectionSnapshot` now carries headers, tags, request/response sizes, durations, and a `body_preview` so tabs can render previews, badges, and size meta without extra fetches.
+- Live intercept queues store the edit previews via `queue_intercept_modification`, and resume/drop decisions now signal the state machine so waiting requests complete with explict 499 drops; we still need to replay the modified body through the same `Incoming` stream once we can reconstruct it.

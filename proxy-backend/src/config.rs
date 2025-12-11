@@ -1,5 +1,9 @@
 use serde::{Deserialize, Serialize};
-use std::{error::Error, fs, io, path::Path};
+use std::{
+    error::Error,
+    fs, io,
+    path::{Path, PathBuf},
+};
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Config {
@@ -38,5 +42,21 @@ impl Config {
             }
             Err(err) => Err(err.into()),
         }
+        .map(|mut config| {
+            config.normalize_paths(path);
+            config
+        })
+    }
+
+    fn normalize_paths(&mut self, config_path: &Path) {
+        let base_dir = config_path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from("."));
+        if Path::new(&self.ca_dir).is_absolute() {
+            return;
+        }
+        let resolved = base_dir.join(&self.ca_dir);
+        self.ca_dir = resolved.to_string_lossy().into_owned();
     }
 }

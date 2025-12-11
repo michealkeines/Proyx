@@ -1,13 +1,17 @@
-use crate::{ConnectionState, MitmProxy};
-use http_body_util::{BodyExt, combinators::BoxBody};
+use crate::{
+    ConnectionState, MitmProxy,
+    proxy_state::{HeaderEntry, InterceptDecision, RequestDetails, ResponseDetails},
+};
+use http_body_util::{BodyExt, Empty, combinators::BoxBody};
 use hyper::{
-    Method, Request, Response, Uri,
+    Method, Request, Response, StatusCode, Uri,
     body::{Body, Incoming},
+    header::{CONTENT_LENGTH, CONTENT_TYPE, HeaderMap, HeaderName},
     service::HttpService,
 };
 use std::{borrow::Borrow, pin::Pin, ptr, sync::Arc};
 use tokio::sync::oneshot;
-use tracing::info;
+use tracing::{info, warn};
 
 type BoxedResponse<S> = Response<
     BoxBody<
@@ -156,6 +160,50 @@ where
 struct RequestMetadata {
     method: Method,
     uri: Uri,
+    headers: HeaderMap,
+}
+
+fn header_entries(headers: &HeaderMap) -> Vec<HeaderEntry> {
+    headers
+        .iter()
+        .map(|(name, value)| HeaderEntry {
+            name: name.as_str().to_string(),
+            value: value.to_str().unwrap_or_default().to_string(),
+        })
+        .collect()
+}
+
+fn header_value_u64(headers: &HeaderMap, name: &HeaderName) -> Option<u64> {
+    headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok())
+}
+
+fn build_request_tags(metadata: &RequestMetadata) -> Vec<String> {
+    let mut tags = vec![metadata.method.to_string()];
+    if let Some(host) = metadata.uri.host() {
+        tags.push(host.to_string());
+    }
+    if let Some(scheme) = metadata.uri.scheme_str() {
+        tags.push(scheme.to_string());
+    }
+    tags
+}
+
+fn build_body_preview(metadata: &RequestMetadata, request_size: Option<u64>) -> Option<String> {
+    let mut parts = Vec::new();
+    if let Some(content_type) = metadata
+        .headers
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+    {
+        parts.push(format!("Content-Type: {content_type}"));
+    }
+    if let Some(size) = request_size {
+        parts.push(format!("{size} bytes"));
+    }
+    (!parts.is_empty()).then(|| parts.join(" · "))
 }
 
 struct Connection<I, S>
@@ -274,6 +322,7 @@ where
         let metadata = RequestMetadata {
             method: request.method().clone(),
             uri: request.uri().clone(),
+            headers: request.headers().clone(),
         };
         connection.metadata = Some(metadata.clone());
         let ui_state = connection.proxy.ui_state.clone();
@@ -281,6 +330,18 @@ where
             .register_connection(metadata.method.to_string(), metadata.uri.to_string())
             .await;
         connection.connection_id = Some(connection_id);
+        let request_size = header_value_u64(&metadata.headers, &CONTENT_LENGTH);
+        ui_state
+            .update_request_details(
+                connection_id,
+                RequestDetails {
+                    headers: header_entries(&metadata.headers),
+                    request_size,
+                    tags: build_request_tags(&metadata),
+                    body_preview: build_body_preview(&metadata, request_size),
+                },
+            )
+            .await;
 
         Ok(Execution::Continue(State::Intercept(InterceptState {
             connection: self.connection,
@@ -365,7 +426,7 @@ where
 {
     connection: *mut Connection<I, S>,
     request: Option<Request<Incoming>>,
-    resume: oneshot::Receiver<()>,
+    resume: oneshot::Receiver<InterceptDecision>,
     connection_id: u64,
 }
 
@@ -385,23 +446,56 @@ where
 {
     async fn run(self) -> Result<Execution<I, S>, <S as HttpService<Incoming>>::Error> {
         let connection = unsafe { &mut *self.connection };
-        let _ = self.resume.await;
-
-        let request = self
-            .request
-            .expect("await resume state keeps the request alive");
-        let pending = connection.service.call(request);
-        let waiting = WaitingIoState {
-            connection: self.connection,
-            pending: Box::pin(pending),
-            connection_id: self.connection_id,
+        let decision = match self.resume.await {
+            Ok(value) => value,
+            Err(_) => {
+                warn!(
+                    "Intercept waiter dropped before decision for request {}",
+                    self.connection_id
+                );
+                InterceptDecision::Drop
+            }
         };
-        let ui_state = connection.proxy.ui_state.clone();
-        ui_state
-            .update_state(self.connection_id, ConnectionState::WaitingIo, None)
-            .await;
 
-        Ok(Execution::Continue(State::WaitingIo(waiting)))
+        match decision {
+            InterceptDecision::Resume => {
+                let request = self
+                    .request
+                    .expect("await resume state keeps the request alive");
+                let _ = connection
+                    .proxy
+                    .ui_state
+                    .clone()
+                    .take_intercept_modification(self.connection_id)
+                    .await;
+                let pending = connection.service.call(request);
+                let waiting = WaitingIoState {
+                    connection: self.connection,
+                    pending: Box::pin(pending),
+                    connection_id: self.connection_id,
+                };
+                let ui_state = connection.proxy.ui_state.clone();
+                ui_state
+                    .update_state(self.connection_id, ConnectionState::WaitingIo, None)
+                    .await;
+
+                Ok(Execution::Continue(State::WaitingIo(waiting)))
+            }
+            InterceptDecision::Drop => {
+                let ui_state = connection.proxy.ui_state.clone();
+                ui_state
+                    .update_state(self.connection_id, ConnectionState::Response, Some(499))
+                    .await;
+                let body = Empty::<<<S as HttpService<Incoming>>::ResBody as Body>::Data>::new()
+                    .map_err(|never| match never {})
+                    .boxed();
+                let response = Response::builder()
+                    .status(StatusCode::from_u16(499).unwrap())
+                    .body(body)
+                    .expect("failed to build drop response");
+                Ok(Execution::Ready(response))
+            }
+        }
     }
 }
 
@@ -489,6 +583,18 @@ where
         let ui_state = connection.proxy.ui_state.clone();
         ui_state
             .update_state(self.connection_id, ConnectionState::Response, Some(status))
+            .await;
+        let response_headers = header_entries(response.headers());
+        let response_size = header_value_u64(response.headers(), &CONTENT_LENGTH);
+        ui_state
+            .update_response_details(
+                self.connection_id,
+                ResponseDetails {
+                    headers: response_headers,
+                    response_size,
+                    duration_ms: None,
+                },
+            )
             .await;
         let boxed = response.map(|body| body.boxed());
 

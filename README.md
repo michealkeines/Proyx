@@ -63,6 +63,7 @@ Certificates are generated with `rcgen` on the fly. You can trust the CA by copy
 - The Tauri backend (`proyxui/src-tauri/src/lib.rs`) now exposes the same proxy state as commands/events, forwards `ProxyEvent` via `app_handle.emit("proxy-event", …)`, and spins up the proxy server from `MitmProxy::bind` before launching the window.
 - The shell mirrors the example template: a thin `src-tauri/src/main.rs` calls `proyxui_lib::run()`, `build.rs` runs `tauri_build::build`, and `tauri.conf.json` keeps the v2 schema while pointing at the React build output.
 - Run `cargo tauri dev` from `proyxui/src-tauri` (with the React dev server on `devUrl`) to iterate, or `npm run build` from `proyxui` and then `cargo tauri build` to bundle.
+- `Config::load` now walks up the directory tree when locating `proxy-config.toml` and resolves `ca_dir` relative to that location so both the CLI proxy and the Tauri shell reuse the same CA directory regardless of how they were launched.
 
 ## Building / running
 
@@ -72,8 +73,8 @@ Certificates are generated with `rcgen` on the fly. You can trust the CA by copy
 
 ## Open gaps & improvements
 
-1. **Live intercept controls** – the UI already surfaces Resume/Modify/Drop actions, but the backend still treats these mainly as state transitions; wire the UI payloads to real request mutations (and persist edited bodies) inside `ProxyState`.
-2. **Replay enrichment** – the replay tab mirrors stored snapshots, but payloads and response metadata are lightweight; stream more headers/bodies/duration info from `ProxyState` so the editor can faithfully replay traffic.
-3. **State metadata & filtering** – the `ConnectionStore` normalizes backend snapshots, but it could retain timestamps, tags, and session growth to drive richer filters/pagination; consider memoized selectors or virtualization for long histories.
+1. **Live intercept controls** – Resume/Drop now resolve to actual decisions so waiting requests complete, and the UI queues modified bodies in `ProxyState`, yet we still need the state machine to inject the edited payload back into the resumed `Incoming` stream so downstream servers see the latest edits.
+2. **Replay enrichment** – the replay tab already exposes headers, tags, sizes, durations, and previews emitted from `ProxyState`, but we can extend this by supporting persistent replay collections, scheduling helpers, and storing response metadata so editors can rehydrate a session end-to-end.
+3. **State metadata & filtering** – `ConnectionStore` now preserves tags, durations, timestamps, and size hints for richer badges and filters; future work includes virtualization/pagination, memoized selectors for large histories, and exposing header/tag facets for filtering.
 4. **Testing & tooling** – add unit/integration coverage for the `ConnectionStore`, tauri commands, and `ProxyEvent` wiring so UI workflows (toggle, resume, replay) stay reliable across refactors.
-5. **Documentation** – keep `ui_mode_design.md` synced with the React tabs/components, list the available Tauri invocations in this README, and capture how the renderer consumes `proxy-event` payloads for future contributors.
+5. **Documentation** – keep `ui_mode_design.md` synced with the React tabs/components, catalog the Tauri invocations, and capture how the renderer consumes `proxy-event` payloads for future contributors.
